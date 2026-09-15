@@ -1,11 +1,12 @@
 // HTTP 服务：静态资源 + JSON API（零依赖：node:http / fs / crypto）
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
-import { readFile, stat, mkdir } from 'node:fs/promises';
+import { readFile, stat, mkdir, copyFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 import { Store, completeness, normalizeLink, DOWNLOAD_TARGETS, linkKey } from './lib/store.mjs';
 import { parseXlsx, parseCsv, toTable } from './lib/xlsx.mjs';
@@ -20,13 +21,38 @@ const publicify = (r) => ({ ...r, completeness: undefined });
 
 const ROOT = path.resolve(new URL('.', import.meta.url).pathname, '..');
 const WEB = path.join(ROOT, 'web');
-const DATA = path.join(ROOT, 'data');
-const UPLOADS = path.join(WEB, 'uploads');
+/**
+ * Serverless（Vercel）里应用目录是只读的，只有 /tmp 可写，
+ * 所以云端把「数据文件」和「上传目录」指到临时盘，本地开发仍用仓库里的 data/ 与 web/uploads/。
+ * 注意：/tmp 属于单个实例的临时盘，冷启动即清空，不能当数据库用（见 README「部署」一节）。
+ */
+const ON_SERVERLESS = process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
+const DATA = process.env.AURORA_DATA_DIR || (ON_SERVERLESS ? path.join(os.tmpdir(), 'aurora-data') : path.join(ROOT, 'data'));
+const UPLOADS = process.env.AURORA_UPLOADS_DIR || (ON_SERVERLESS ? path.join(os.tmpdir(), 'aurora-uploads') : path.join(WEB, 'uploads'));
 const PORT = Number(process.env.PORT || 5180);
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || (ON_SERVERLESS ? '0.0.0.0' : '127.0.0.1');
 const DEFAULT_ADMIN = { user: 'admin', pass: process.env.AURORA_ADMIN_PASS || 'aurora888' };
 
+if (ON_SERVERLESS) await primeFromSnapshot();
 const store = await new Store(DATA).init();
+
+/**
+ * Serverless 冷启动时 /tmp 是空的。若仓库里提交了 data/db.json（可选，见 README），
+ * 就把它复制进临时盘，让云端至少能展示这份数据；写操作仍然只活在当前实例里。
+ */
+async function primeFromSnapshot() {
+  try {
+    const snapshot = path.join(ROOT, 'data', 'db.json');
+    const target = path.join(DATA, 'db.json');
+    if (!(await stat(snapshot).catch(() => null))) return;
+    if (await stat(target).catch(() => null)) return;
+    await mkdir(DATA, { recursive: true });
+    await copyFile(snapshot, target);
+    console.log('[serverless] 已从仓库快照初始化数据：' + path.relative(ROOT, snapshot));
+  } catch (err) {
+    console.warn('[serverless] 快照初始化跳过：' + err.message);
+  }
+}
 if (!store.db.admin.passHash) {
   store.db.admin.user = DEFAULT_ADMIN.user;
   store.db.admin.secret = randomUUID();
@@ -43,7 +69,14 @@ function hashPass(pass, secret) {
 
 async function ensureSeed() {
   if (store.db.resources.length) return;
-  const { seedResources, seedSubmissions, seedLogs } = await import('./seed.mjs');
+  let seed;
+  try {
+    seed = await import('./seed.mjs');
+  } catch (err) {
+    console.warn('[seed] 跳过示例数据：' + err.message);
+    return;
+  }
+  const { seedResources, seedSubmissions, seedLogs } = seed;
   for (const r of seedResources()) {
     const rec = store.createResource(r, 'seed');
     rec.views = r.views || 0;
@@ -240,7 +273,7 @@ async function handle(req, res) {
   const url = { pathname, searchParams: rawUrl.searchParams, href: rawUrl.href };
   const p = pathname;
   const method = req.method === 'HEAD' ? 'GET' : req.method;
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const ip = (req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || '').split(',')[0].trim();
   res.setHeader('x-powered-by', 'AuroraVault');
   if (method === 'OPTIONS') {
     res.writeHead(204, { 'access-control-allow-origin': req.headers.origin || '*', 'access-control-allow-headers': 'content-type,x-aurora-session', 'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS', 'access-control-max-age': '600' });
@@ -703,14 +736,21 @@ async function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === '/' || rel === '') rel = '/index.html';
   if (rel === '/admin' || rel === '/admin/' || rel === '/manage') rel = '/admin.html';
-  const abs = path.join(WEB, rel);
-  if (!abs.startsWith(WEB)) {
+  if (rel.split('/').includes('..')) {
     return text(res, 403, '禁止访问', { 'content-type': 'text/plain; charset=utf-8' });
   }
-  let file = abs;
-  const info = await stat(abs).catch(() => null);
-  if (info && info.isDirectory()) file = path.join(abs, 'index.html');
-  if (!(await stat(file).catch(() => null))) {
+  // 上传图在云端落在 /tmp，仓库里的种子图仍在 web/uploads，两处都找一遍
+  const bases = rel.startsWith('/uploads/') ? [UPLOADS, WEB] : [WEB];
+  let file = null;
+  for (const root of bases) {
+    const abs = path.join(root, rel);
+    if (!abs.startsWith(root + path.sep)) continue;
+    let info = await stat(abs).catch(() => null);
+    const target = info && info.isDirectory() ? path.join(abs, 'index.html') : abs;
+    info = await stat(target).catch(() => null);
+    if (info && info.isFile()) { file = target; break; }
+  }
+  if (!file) {
     // 单页应用兜底
     const fallback = rel.includes('.') ? null : (rel.startsWith('/admin') ? path.join(WEB, 'admin.html') : path.join(WEB, 'index.html'));
     if (!fallback) return text(res, 404, '404 · 未找到 ' + rel, { 'content-type': 'text/plain; charset=utf-8' });
@@ -738,14 +778,22 @@ server.requestTimeout = 45000;
 server.on('clientError', (err, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 
 await mkdir(UPLOADS, { recursive: true });
-await listen(server, PORT, HOST);
-const urls = candidateUrls(PORT, HOST);
-store.log('system', '服务已启动 · ' + urls[0], { port: PORT });
-store.save();
-console.log('\n  ✦ 极昼资源库 AURORA VAULT 已启动');
-for (const u of urls) console.log('    → ' + u + (u.includes('127.0.0.1') ? '   (后台 /admin)' : ''));
-console.log('    数据文件：' + path.relative(ROOT, store.file));
-console.log('    默认管理员：' + store.db.admin.user + ' / ' + (process.env.AURORA_ADMIN_PASS || DEFAULT_ADMIN.pass) + '\n');
+
+/** 同一个模块两种用法：本地 node server/index.mjs 监听端口；Serverless 里由 api/index.mjs 取 handle。 */
+export { handle, store, ROOT, WEB, DATA, UPLOADS, PORT, HOST };
+
+const DIRECT_RUN = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+if (DIRECT_RUN) {
+  await listen(server, PORT, HOST);
+  const urls = candidateUrls(PORT, HOST);
+  store.log('system', '服务已启动 · ' + urls[0], { port: PORT });
+  store.save();
+  console.log('\n  ✦ 极昼资源库 AURORA VAULT 已启动' + (ON_SERVERLESS ? '（Serverless / 临时存储）' : ''));
+  for (const u of urls) console.log('    → ' + u + (u.includes('127.0.0.1') ? '   (后台 /admin)' : ''));
+  console.log('    数据文件：' + store.file);
+  console.log('    上传目录：' + UPLOADS);
+  console.log('    默认管理员：' + store.db.admin.user + ' / ' + (process.env.AURORA_ADMIN_PASS || DEFAULT_ADMIN.pass) + '\n');
+}
 
 function listen(srv, port, host) {
   return new Promise((resolve, reject) => {

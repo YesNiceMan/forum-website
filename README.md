@@ -134,6 +134,31 @@ npm run check:all      # 依次执行以上全部
 
 ---
 
+## 部署
+
+### 单机 / 内网（功能完整，推荐）
+
+```bash
+AURORA_ADMIN_PASS='强口令' PORT=8080 HOST=0.0.0.0 node server/index.mjs
+```
+
+数据在 `data/db.json`，上传与镜像图在 `web/uploads/`，配合 pm2 / systemd / 反代长期运行。导入、编辑、投稿、上传、计数在这条路径上都能真正落盘。
+
+### Vercel（Serverless）
+
+仓库自带 `api/index.mjs` + `vercel.json`：静态资源由 Vercel CDN 直出（`outputDirectory: web`），`/api/*`、`/uploads/*` 与页面兜底改写到一个 Node.js 函数；该函数复用 `server/index.mjs` 导出的 `handle(req, res)`，不需要 `listen`（同一模块靠 `DIRECT_RUN` 判断：`node server/index.mjs` 时才监听端口）。
+
+1. 导入 GitHub 仓库后，把 **Framework Preset 由 `Node.js` 改成 `Other`**。选 Node.js 时 Vercel 只会在 `app.js` / `src/index.mjs` 这批候选名里找入口，本项目入口是 `server/index.mjs`，这就是 `No entrypoint found in "/vercel/path0"` 的来源。
+2. Environment Variables 加 `AURORA_ADMIN_PASS`；不设则后台仍是默认口令 `admin / aurora888`。
+3. Deploy。前台浏览、搜索、详情、聚合检索、Excel 解析预览、后台登录都可用。
+
+**云端限制**：Vercel 函数根文件系统只读，只有 `/tmp` 可写且随冷启动清空。所以 `DATA` / `UPLOADS` 会自动指向 `/tmp/aurora-data`、`/tmp/aurora-uploads`（可用 `AURORA_DATA_DIR`、`AURORA_UPLOADS_DIR` 覆盖），写入只在当前实例存活期间生效，不跨实例、不跨冷启动——后台的编辑 / 入库 / 投稿 / 上传在 Vercel 上属于"可演示、不可依赖"。
+
+- 想让云端显示本地真实数据：`git add -f data/db.json` 一并提交，冷启动会自动复制进 `/tmp`（见 `primeFromSnapshot()`）。注意 `db.json` 含投稿、操作日志与后台口令哈希，公开仓库请三思。
+- 需要真正的持久化：换带磁盘的平台（Fly.io / Railway / Render / 自建 VPS，代码零改动），或把存储层换成 Vercel Blob + Postgres/KV。
+
+---
+
 ## 安全与限制
 
 - 口令：`sha256(口令 + 每实例随机 salt)`，登录会话为 httpOnly Cookie（`aurora_sid`）并持久化；同一账号 6 次失败锁定 5 分钟；修改口令会使所有会话失效。
@@ -164,6 +189,8 @@ web/
   assets/css/{base,pages,admin}.css
   assets/js/{core,ui,form,app,admin}.js + pages/*.js
   uploads/               # 上传与镜像图片
+api/index.mjs            # Vercel / Serverless 入口（复用 server/index.mjs 的 handle）
+vercel.json              # Vercel 构建配置：web/ 静态直出 + 动态请求改写
 tools/                   # 样例生成、重置、以及 5 个自检脚本
 samples/                 # 演示 xlsx / csv
 data/                    # 运行时数据（db.json）

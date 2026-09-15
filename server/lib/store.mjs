@@ -71,6 +71,20 @@ export class Store {
     return this._pending;
   }
 
+  /** 立刻落盘：Serverless（Vercel）在 handler 返回后会冻结实例，防抖计时器不会有机会触发 */
+  async drain() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    const done = this._resolve;
+    this._pending = null;
+    this._resolve = null;
+    await this.flush();
+    done && done(this);
+    return this;
+  }
+
   log(kind, message, meta = {}) {
     this.db.logs.unshift({ id: newId('l'), kind, message, meta, at: NOW() });
     if (this.db.logs.length > 600) this.db.logs.length = 600;

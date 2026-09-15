@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "main": "server/index.mjs",
   "description": "极昼资源库 · 零依赖用户资源管理网站（Excel 导入 + 链接图文识别 + 聚合搜索 + 后台管理）",
   "engines": {
     "node": ">=18.17"

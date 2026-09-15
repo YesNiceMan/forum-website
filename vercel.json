@@ -1,0 +1,20 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "",
+  "installCommand": "npm install --ignore-scripts --no-audit --no-fund",
+  "outputDirectory": "web",
+  "functions": {
+    "api/index.mjs": {
+      "memory": 1024,
+      "maxDuration": 60,
+      "includeFiles": { "web/**": true, "data/**": true }
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/uploads/(.*)", "destination": "/api/index" },
+    { "source": "/admin", "destination": "/admin.html" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
