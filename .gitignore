@@ -1,0 +1,9 @@
+node_modules/
+data/db.json
+data/db.json.tmp
+data/*.bak
+web/uploads/*
+!web/uploads/seed/
+.shots/
+*.log
+.DS_Store

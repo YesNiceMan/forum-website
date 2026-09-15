@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>AURORA 资源库 · 极昼之下，好资源自带光</title>
+<meta name="description" content="AURORA 资源库：支持 Excel 批量导入、链接图文自动识别、信息补全审核、网盘 / 磁力 / 站点聚合搜索的用户资源管理平台。" />
+<meta name="theme-color" content="#06070d" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='.5' stop-color='%2322d3ee'/%3E%3Cstop offset='1' stop-color='%23f472b6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='18' fill='%2307080f'/%3E%3Cpath d='M14 46 32 14l18 32' fill='none' stroke='url(%23g)' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M22 36h20' stroke='url(%23g)' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/assets/css/base.css" />
+<link rel="stylesheet" href="/assets/css/pages.css" />
+<script type="module" src="/assets/js/app.js"></script>
+</head>
+<body>
+<div class="aurora" aria-hidden="true">
+  <span class="aurora__blob aurora__blob--a"></span>
+  <span class="aurora__blob aurora__blob--b"></span>
+  <span class="aurora__blob aurora__blob--c"></span>
+  <span class="aurora__grid"></span>
+  <span class="aurora__grain"></span>
+</div>
+<a class="skip-link" href="#view">跳到主要内容</a>
+
+<header class="topbar" id="topbar">
+  <a class="brand" href="#/" aria-label="AURORA 资源库首页">
+    <span class="brand__mark"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M14 46 32 14l18 32" fill="none" stroke="url(#brandGrad)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 36h20" stroke="url(#brandGrad)" stroke-width="5.5" stroke-linecap="round"/><defs><linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs></svg></span>
+    <span class="brand__text"><strong id="brandName">AURORA</strong><em data-site-tagline>资源库</em></span>
+  </a>
+  <nav class="mainnav" id="mainnav" aria-label="主导航">
+    <a href="#/" data-route="/"><span>发现</span></a>
+    <a href="#/library" data-route="/library"><span>资源库</span></a>
+    <a href="#/search" data-route="/search"><span>聚合搜索</span></a>
+    <a href="#/import" data-route="/import"><span>导入中心</span></a>
+    <a href="#/submit" data-route="/submit"><span>投稿补全</span></a>
+  </nav>
+  <div class="topbar__actions">
+    <button class="kbtn" id="paletteBtn" type="button" aria-label="打开快捷搜索">
+      <svg viewBox="0 0 24 24" class="icon"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm5.5 13.5L20 21" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      <span>快捷搜索</span><kbd>⌘K</kbd>
+    </button>
+    <button class="icon-btn" id="themeBtn" type="button" aria-label="切换明暗主题">
+      <svg viewBox="0 0 24 24" class="icon"><path d="M12 3v2m0 14v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M3 12h2m14 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+    </button>
+    <a class="btn btn--ghost btn--sm" href="/admin">后台管理</a>
+  </div>
+</header>
+
+<main id="view" class="view" tabindex="-1"></main>
+
+<footer class="site-footer">
+  <div class="site-footer__inner">
+    <div>
+      <p class="mono">AURORA VAULT · 零依赖 Node + 原生 Web</p>
+      <p class="muted" data-site-tagline>极昼之下，好资源自带光</p>
+    </div>
+    <div class="site-footer__links">
+      <a href="#/library">资源库</a><a href="#/import">Excel 导入</a><a href="#/search">聚合搜索</a><a href="/admin">管理后台</a>
+    </div>
+    <p class="mono tiny muted" data-footer-note></p>
+  </div>
+</footer>
+
+<div class="palette" id="palette" hidden>
+  <div class="palette__panel" role="dialog" aria-modal="true" aria-label="快捷搜索">
+    <div class="palette__input">
+      <svg viewBox="0 0 24 24" class="icon"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm5.5 13.5L20 21" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      <input id="paletteInput" type="text" placeholder="搜索标题 / 名字 / 标签，回车进行全网聚合搜索" autocomplete="off" spellcheck="false" />
+      <kbd>ESC</kbd>
+    </div>
+    <ul class="palette__list" id="paletteList"></ul>
+    <div class="palette__foot"><span><kbd>↑</kbd><kbd>↓</kbd> 选择</span><span><kbd>↵</kbd> 打开</span><span><kbd>⌘</kbd>+<kbd>↵</kbd> 聚合搜索</span></div>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot" class="toasts" aria-live="polite"></div>
+<div id="lightbox" class="lightbox" hidden><button class="lightbox__close icon-btn" id="lightboxClose" aria-label="关闭">×</button><div class="lightbox__stage" id="lightboxStage"></div><div class="lightbox__bar"><span id="lightboxCaption"></span><span class="mono" id="lightboxIndex"></span></div><button class="lightbox__nav lightbox__nav--prev" id="lightboxPrev" aria-label="上一张">‹</button><button class="lightbox__nav lightbox__nav--next" id="lightboxNext" aria-label="下一张">›</button></div>
+<div class="scroll-progress" id="scrollProgress" aria-hidden="true"></div>
+</body>
+</html>

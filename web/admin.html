@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>后台管理 · AURORA 资源库</title>
+<meta name="description" content="AURORA 资源库后台：资源管理、Excel 导入、投稿审核、分类标签、检索来源、媒体库、日志与站点设置。" />
+<meta name="theme-color" content="#06070d" />
+<meta name="robots" content="noindex, nofollow" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='.5' stop-color='%2322d3ee'/%3E%3Cstop offset='1' stop-color='%23f472b6'/%3E%3C/defs%3E%3Crect width='64' height='64' rx='18' fill='%2307080f'/%3E%3Cpath d='M14 46 32 14l18 32' fill='none' stroke='url(%23g)' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M22 36h20' stroke='url(%23g)' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/assets/css/base.css" />
+<link rel="stylesheet" href="/assets/css/pages.css" />
+<link rel="stylesheet" href="/assets/css/admin.css" />
+<script type="module" src="/assets/js/admin.js"></script>
+</head>
+<body class="admin-body">
+<div class="aurora" aria-hidden="true">
+  <span class="aurora__blob aurora__blob--a"></span>
+  <span class="aurora__blob aurora__blob--b"></span>
+  <span class="aurora__blob aurora__blob--c"></span>
+  <span class="aurora__grid"></span>
+  <span class="aurora__grain"></span>
+</div>
+
+<div class="admin" id="admin">
+  <aside class="admin-side" id="adminSide">
+    <a class="brand" href="/" aria-label="返回前台">
+      <span class="brand__mark"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M14 46 32 14l18 32" fill="none" stroke="url(#brandGradA)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 36h20" stroke="url(#brandGradA)" stroke-width="5.5" stroke-linecap="round"/><defs><linearGradient id="brandGradA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs></svg></span>
+      <span class="brand__text"><strong>AURORA</strong><em>控制台</em></span>
+    </a>
+    <nav class="admin-nav" id="adminNav" aria-label="后台导航"></nav>
+    <div class="admin-side__foot">
+      <div class="admin-user" id="adminUser"><span class="avatar">A</span><span class="grow" style="min-width:0"><b class="truncate">admin</b><br /><span class="tiny mono muted">已登录</span></span></div>
+      <div class="row row--tight" style="margin-top:8px">
+        <a class="btn btn--sm btn--quiet grow" href="/">↗ 前台</a>
+        <button class="btn btn--sm btn--quiet" id="themeBtn" type="button" title="切换明暗">◐</button>
+        <button class="btn btn--sm btn--quiet" id="logoutBtn" type="button">退出</button>
+      </div>
+      <p class="tiny mono muted" style="margin-top:10px" id="adminVersion">AURORA VAULT</p>
+    </div>
+  </aside>
+
+  <div class="admin-col">
+    <header class="admin-top" id="adminTop">
+      <button class="icon-btn admin-burger" id="adminBurger" aria-label="展开菜单">☰</button>
+      <div class="admin-crumb" id="adminCrumb"><span class="mono tiny muted">控制台</span></div>
+      <label class="admin-search">
+        <svg viewBox="0 0 24 24" class="icon"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm5.5 13.5L20 21" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        <input id="adminSearch" placeholder="搜索资源标题 / 标签，回车进入管理列表" autocomplete="off" />
+        <kbd>↵</kbd>
+      </label>
+      <div class="row row--tight" id="adminTopActs"></div>
+    </header>
+    <main class="admin-main" id="adminMain" tabindex="-1">
+      <div class="admin-boot"><span class="spinner"></span><span class="small muted">正在连接控制台…</span></div>
+    </main>
+  </div>
+</div>
+
+<div class="admin-login" id="adminLogin" hidden>
+  <div class="admin-login__card card">
+    <span class="admin-login__mark"><svg viewBox="0 0 64 64"><path d="M14 46 32 14l18 32" fill="none" stroke="url(#lg)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 36h20" stroke="url(#lg)" stroke-width="5.5" stroke-linecap="round"/><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs></svg></span>
+    <h1>后台管理</h1>
+    <p class="muted small">AURORA 资源库控制台 · 批量导入 / 补全审核 / 来源管理</p>
+    <form id="loginForm" autocomplete="on">
+      <div class="field"><label>账号</label><input class="input" id="loginUser" value="admin" autocomplete="username" /></div>
+      <div class="field" style="margin-top:12px"><label>口令</label><input class="input" id="loginPass" type="password" placeholder="默认 aurora888" autocomplete="current-password" /></div>
+      <button class="btn btn--primary btn--block" style="margin-top:16px" type="submit">登录控制台</button>
+    </form>
+    <p class="tiny muted" style="margin-top:14px">连续错误 6 次会临时锁定 5 分钟 · <a class="link-quiet" href="/">返回前台</a></p>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot" class="toasts" aria-live="polite"></div>
+<div id="lightbox" class="lightbox" hidden><button class="lightbox__close icon-btn" id="lightboxClose" aria-label="关闭">×</button><div class="lightbox__stage" id="lightboxStage"></div><div class="lightbox__bar"><span id="lightboxCaption"></span><span class="mono" id="lightboxIndex"></span></div><button class="lightbox__nav lightbox__nav--prev" id="lightboxPrev" aria-label="上一张">‹</button><button class="lightbox__nav lightbox__nav--next" id="lightboxNext" aria-label="下一张">›</button></div>
+<div class="scroll-progress" id="scrollProgress" aria-hidden="true"></div>
+</body>
+</html>

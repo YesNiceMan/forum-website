@@ -1,0 +1,24 @@
+{
+  "name": "aurora-vault",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "极昼资源库 · 零依赖用户资源管理网站（Excel 导入 + 链接图文识别 + 聚合搜索 + 后台管理）",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "sample": "node tools/make-sample.mjs",
+    "posters": "node tools/make-posters.mjs",
+    "reset": "node tools/reset.mjs",
+    "check": "node tools/smoke.mjs",
+    "check:ui": "node tools/render-check.mjs",
+    "check:admin": "node tools/admin-check.mjs",
+    "check:flow": "node tools/flow-check.mjs",
+    "check:layout": "node tools/layout-audit.mjs",
+    "check:modules": "node tools/check-modules.mjs",
+    "check:all": "npm run check:modules && npm run check && npm run check:ui && npm run check:admin && npm run check:flow && npm run check:layout"
+  }
+}
