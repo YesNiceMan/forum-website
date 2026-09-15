@@ -1,7 +1,7 @@
 // JSON 文件存储：资源 / 用户投稿 / 来源配置 / 站点设置 / 统计 / 日志
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { newId, NOW, normalizeTitle, uniq, fnv, sanitizeHtml, textToHtml } from './util.mjs';
+import { newId, NOW, normalizeTitle, uniq, fnv, sanitizeHtml, textToHtml, truncate, stripTags } from './util.mjs';
 import { classify, extractUrls } from './links.mjs';
 import { DEFAULT_SOURCES } from './sources.mjs';
 
@@ -202,8 +202,8 @@ export class Store {
   createSubmission(input) {
     const sub = {
       id: newId('s'),
-      // kind=source：给已有资源补来源，审核通过后并入原条目；kind=resource：全新投稿
-      kind: input.kind === 'source' ? 'source' : 'resource',
+      // kind=source 补来源 / kind=patch 补内容（都是写回原条目）/ 其余 resource = 全新投稿
+      kind: input.kind === 'source' || input.kind === 'patch' ? input.kind : 'resource',
       title: String(input.title || '').trim().slice(0, 160),
       type: resolveType(input.type, this.db.types),
       tags: uniq(asList(input.tags).map(String)).slice(0, 20),
@@ -223,6 +223,8 @@ export class Store {
       resourceId: String(input.resourceId || '').slice(0, 40),
       resourceTitle: String(input.resourceTitle || '').slice(0, 200),
       note: String(input.note || '').slice(0, 500),
+      // kind=patch：待写入的「位置 + 内容」列表，管理员点「写入资源」时按同样规则落库
+      inserts: Array.isArray(input.inserts) ? input.inserts.slice(0, 24) : [],
       ip: input.ip || '',
     };
     this.db.submissions.unshift(sub);
@@ -270,6 +272,189 @@ export class Store {
     this.addTags(resource.tags || []);
     this.save();
     return { resource, report };
+  }
+
+  /**
+   * 「找更多来源」的落点：把点到的文字 / 图片写回资源的对应位置。
+   * 每条 insert 形如 { field, value }：
+   *   title/summary/notes/sourceUrl/type → 字符串；score → 数字；meta → 年份等对象
+   *   content → 文字（纯文本会转成段落，正文只追加不覆盖）
+   *   cover / gallery → 图片（gallery 传 { url, caption }）
+   *   tags → 字符串数组；downloads / others → 链接对象
+   * 写入策略：短字段只在为空时填（除非 overwrite），列表字段去重后追加，
+   * 正文一律追加在末尾并标出出处，绝不冲掉人工写好的内容。
+   */
+  insertInto(id, inserts = [], { actor = 'admin', overwrite = false, source = '' } = {}) {
+    const cur = this.findResource(id);
+    if (!cur) return null;
+    const patch = {};
+    const report = { filled: [], appended: [], skipped: [], duplicate: [], invalid: [] };
+    const mark = (list, key, label) => { if (!list.some((x) => x.key === key && x.label === label)) list.push({ key, label }); };
+    const texts = [];
+    const images = [];
+    const tagAdds = [];
+    const dlAdds = [];
+    const otherAdds = [];
+    for (const raw of (Array.isArray(inserts) ? inserts : []).slice(0, 40)) {
+      const field = String((raw && raw.field) || '').trim();
+      const value = raw ? raw.value : '';
+      if (!field) { report.invalid.push({ field, reason: '缺少目标位置' }); continue; }
+      if (field === 'title') {
+        const v = truncate(String(value || '').replace(/\s+/g, ' ').trim(), 160);
+        if (!v) { report.invalid.push({ field, reason: '标题为空' }); continue; }
+        if (cur.title && !overwrite) { report.skipped.push({ field, reason: '已有标题' }); continue; }
+        patch.title = v;
+        mark(report.filled, 'title', '标题');
+        continue;
+      }
+      if (field === 'summary' || field === 'notes') {
+        const v = truncate(stripTags(String(value || '')).replace(/\s+/g, ' ').trim(), field === 'summary' ? 600 : 2000);
+        if (!v) { report.invalid.push({ field, reason: '文字为空' }); continue; }
+        if (String(cur[field] || '').includes(v.slice(0, 40))) { report.duplicate.push({ field, label: field === 'summary' ? '简介' : '备注' }); continue; }
+        if (cur[field] && !overwrite) {
+          patch[field] = truncate(String(cur[field]).replace(/\s+$/, '') + (cur[field] ? ' ' : '') + v, field === 'summary' ? 1200 : 4000);
+          mark(report.appended, field, field === 'summary' ? '简介' : '备注');
+        } else {
+          patch[field] = v;
+          mark(report.filled, field, field === 'summary' ? '简介' : '备注');
+        }
+        continue;
+      }
+      if (field === 'content') {
+        const plain = stripTags(String(value || '')).replace(/\s+/g, ' ').trim();
+        if (!plain) { report.invalid.push({ field, reason: '文字为空' }); continue; }
+        const bodyHtml = /<[a-z][\s\S]*>/i.test(String(value)) ? sanitizeHtml(String(value)) : textToHtml(String(value));
+        if (!bodyHtml || bodyHtml === '<p></p>') { report.invalid.push({ field, reason: '文字为空' }); continue; }
+        texts.push({ html: bodyHtml, plain });
+        continue;
+      }
+      if (field === 'cover') {
+        const url = String(typeof value === 'string' ? value : (value && value.url) || '').trim();
+        if (!/^(https?:\/\/|\/uploads\/|\/assets\/|data:image)/i.test(url)) { report.invalid.push({ field, reason: '图片地址不可用' }); continue; }
+        if (cur.cover && !overwrite) {
+          // 已有封面就不覆盖，降级成一张图集图，并在报告里说明
+          report.skipped.push({ field, reason: '已有封面，已改记入图集' });
+          images.push({ url, caption: String((value && value.caption) || '').slice(0, 60), demoted: true });
+          continue;
+        }
+        patch.cover = url;
+        mark(report.filled, 'cover', '封面');
+        continue;
+      }
+      if (field === 'gallery' || field === 'image') {
+        const v = typeof value === 'string' ? { url: value } : (value || {});
+        const url = String(v.url || '').trim();
+        if (!/^(https?:\/\/|\/uploads\/|\/assets\/|data:image)/i.test(url)) { report.invalid.push({ field: 'gallery', reason: '图片地址不可用' }); continue; }
+        images.push({ url, caption: truncate(String(v.caption || v.alt || '').trim(), 60) });
+        continue;
+      }
+      if (field === 'tags') {
+        const list = Array.isArray(value) ? value : String(value || '').split(/[,，、;；|\s]+/);
+        for (const t of list) { const tag = String(t || '').trim().slice(0, 24); if (tag) tagAdds.push(tag); }
+        continue;
+      }
+      if (field === 'downloads' || field === 'others') {
+        const v = typeof value === 'string' ? { url: value } : (value || {});
+        const link = normalizeLink({ ...v, note: v.note || (source ? '来自' + source : '') });
+        if (!link) { report.invalid.push({ field, reason: '链接格式无法识别' }); continue; }
+        (field === 'downloads' ? dlAdds : otherAdds).push(link);
+        continue;
+      }
+      if (field === 'score') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) { report.invalid.push({ field, reason: '分数无效' }); continue; }
+        if (cur.score && !overwrite) { report.skipped.push({ field, reason: '已有分数' }); continue; }
+        patch.score = Math.min(10, Math.max(0, Math.round(n * 10) / 10));
+        mark(report.filled, 'score', '分数');
+        continue;
+      }
+      if (field === 'type') {
+        const v = String(value || '').trim().slice(0, 20);
+        if (!v) continue;
+        if (cur.type && !overwrite) { report.skipped.push({ field, reason: '已有类型' }); continue; }
+        patch.type = v;
+        mark(report.filled, 'type', '类型');
+        continue;
+      }
+      if (field === 'sourceUrl') {
+        const v = String(value || '').trim().slice(0, 300);
+        if (!/^https?:\/\//i.test(v)) { report.invalid.push({ field, reason: '需要 http(s) 地址' }); continue; }
+        if (cur.sourceUrl && !overwrite) { report.skipped.push({ field, reason: '已有来源地址' }); continue; }
+        patch.sourceUrl = v;
+        mark(report.filled, 'sourceUrl', '来源地址');
+        continue;
+      }
+      if (field === 'meta') {
+        const v = value && typeof value === 'object' ? value : {};
+        const map = { year: '年份', region: '地区', size: '体积', format: '格式', duration: '时长', developer: '作者', language: '语言', publisher: '制作' };
+        const nextMeta = { ...cur.meta };
+        for (const [k, label] of Object.entries(map)) {
+          const nv = String(v[k] || '').trim().slice(0, 120);
+          if (!nv) continue;
+          if (nextMeta[k] && !overwrite) { report.skipped.push({ field: 'meta.' + k, reason: label + '已存在' }); continue; }
+          nextMeta[k] = nv;
+          mark(report.filled, 'meta.' + k, label);
+        }
+        if (Object.keys(nextMeta).length) patch.meta = nextMeta;
+        continue;
+      }
+      report.invalid.push({ field, reason: '暂不支持该位置' });
+    }
+    // 正文：去重后追加，带出处标注
+    const keepPlain = stripTags(String(cur.content || '')).replace(/\s+/g, ' ').trim();
+    const addBlocks = [];
+    for (const t of texts) {
+      if (keepPlain && keepPlain.includes(t.plain.slice(0, 60))) { report.duplicate.push({ field: 'content', label: '内容' }); continue; }
+      addBlocks.push(t.html);
+    }
+    if (addBlocks.length) {
+      const note = source ? '<p class="insourced">↓ 由「找更多来源」补录' + (cur.sourceName || source ? '：' + truncate(String(source), 60) : '') + '</p>' : '';
+      patch.content = String(cur.content || '') + note + addBlocks.join('');
+      mark(report.appended, 'content', '内容');
+    }
+    if (images.length) {
+      const seen = new Set(cur.gallery.map((g) => linkKey(g.url)));
+      if (cur.cover) seen.add(linkKey(cur.cover));
+      let added = 0;
+      const gallery = [...(patch.gallery || []), ...cur.gallery];
+      for (const im of images) {
+        const k = linkKey(im.url);
+        if (seen.has(k)) { report.duplicate.push({ field: 'gallery', label: im.demoted ? '封面（改记图集）' : '图集' }); continue; }
+        seen.add(k);
+        gallery.push({ url: im.url, caption: im.caption || '' });
+        added++;
+      }
+      if (added) {
+        patch.gallery = gallery.slice(0, 40);
+        // 原本没有封面时，第一张图集图顺便当封面（与 normalizeResource 的兜底一致）
+        if (!cur.cover && !patch.cover) { patch.cover = patch.gallery.find((g) => g.url)?.url || ''; if (patch.cover) mark(report.filled, 'cover', '封面'); }
+        mark(report.appended, 'gallery', '图集');
+      }
+    }
+    if (tagAdds.length) {
+      const next = uniq([...cur.tags, ...tagAdds]).slice(0, 24);
+      if (next.length !== cur.tags.length) { patch.tags = next; mark(report.appended, 'tags', '标签'); }
+      else report.duplicate.push({ field: 'tags', label: '标签' });
+    }
+    const mergeList = (field, links) => {
+      if (!links.length) return;
+      const base = [...(patch[field] || cur[field] || [])];
+      const seen = new Set(base.map((x) => linkKey(x.url)));
+      let added = 0;
+      for (const l of links) { if (seen.has(linkKey(l.url))) { report.duplicate.push({ field, label: field === 'downloads' ? '资源下载' : '其他来源' }); continue; } seen.add(linkKey(l.url)); base.push(l); added++; }
+      if (added) { patch[field] = base.slice(0, 60); mark(report.appended, field, field === 'downloads' ? '资源下载' : '其他来源'); }
+    };
+    // 网盘 / 磁力自动归「资源下载」，网页 / 文档归「其他来源」，与 mergeLinks 保持同一套判定
+    const toDownloads = dlAdds.filter((l) => DOWNLOAD_TARGETS.has(l.kind));
+    const toOthers = [...dlAdds.filter((l) => !DOWNLOAD_TARGETS.has(l.kind)), ...otherAdds];
+    mergeList('downloads', toDownloads);
+    mergeList('others', toOthers);
+    if (!Object.keys(patch).length) return { resource: cur, patch, report, applied: false };
+    if (patch.type) this.ensureType(patch.type);
+    const resource = this.updateResource(id, patch, actor);
+    this.addTags(resource.tags || []);
+    this.save();
+    return { resource, patch, report, applied: true, completeness: completeness(resource) };
   }
 
   // ---------- 标签 / 分类 ----------
@@ -492,7 +677,16 @@ function normalizeDb(input = {}) {
     favs: input.favs && typeof input.favs === 'object' ? input.favs : {},
     archive: Array.isArray(input.archive) ? input.archive : [],
     stats: { counters: {}, daily: {}, recent: [], ...input.stats },
-    admin: { user: input.admin?.user || 'admin', passHash: input.admin?.passHash || '', secret: input.admin?.secret || '', isDefault: input.admin?.isDefault !== false, sessions: {} },
+    admin: {
+      user: input.admin?.user || 'admin',
+      passHash: input.admin?.passHash || '',
+      secret: input.admin?.secret || '',
+      isDefault: input.admin?.isDefault !== false,
+      // 会话视图（真正决定登录状态的是签名 Cookie），重启后保留，不再「重启即全员掉线」
+      sessions: input.admin?.sessions && typeof input.admin.sessions === 'object' ? input.admin.sessions : {},
+      revoked: Array.isArray(input.admin?.revoked) ? input.admin.revoked : [],
+      invalidBefore: Number(input.admin?.invalidBefore) || 0,
+    },
   };
   return db;
 }

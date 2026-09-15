@@ -6,9 +6,11 @@ import { completeness } from './store.mjs';
 import { mirrorImage } from './enrich.mjs';
 import { runSource } from './sources.mjs';
 import { classify, extractUrls } from './links.mjs';
+import { enrichDrafts } from './importer.mjs';
+import { GAP_KEYS, GAP_FIELDS, gapReport, blankFields, isBlank, candidateUrls, batchFill } from './gaps.mjs';
 
 export function registerAdmin(ctx) {
-  const { route, store, UPLOADS, requireAdmin, publicSettings, recomputeCounts, dashboardStats, stripInternal, sessionOf } = ctx;
+  const { route, store, UPLOADS, requireAdmin, publicSettings, recomputeCounts, dashboardStats, stripInternal, sessionOf, sessionView } = ctx;
   const guard = (res, req) => requireAdmin(req, res);
   const actor = (req) => (sessionOf(req) || {}).user || 'admin';
   const sessionUser = (req) => actor(req);
@@ -136,6 +138,116 @@ export function registerAdmin(ctx) {
     return { results: out, checked: out.length, message: '链接检测完成' };
   });
 
+  /**
+   * 缺失空白位置一览：按「筛选条件 / 勾选的 id」统计每个位置还空着几条，
+   * 后台「批量补全」面板用它出勾选框、预估工作量与待补清单。
+   */
+  route('GET', /^\/api\/admin\/gaps$/, ({ req, res, query }) => {
+    if (!guard(res, req)) return;
+    const pickedIds = csvParam(query.get('ids'));
+    const picked = applyResourceFilter(query, pickedIds.length ? { ids: pickedIds, onlyBlank: false } : {});
+    const report = gapReport(picked.list);
+    return {
+      gaps: report,
+      fields: GAP_FIELDS,
+      total: picked.total,
+      ids: picked.ids,
+      // 待补清单预览：完整度最低的一批，逐条列出还空着哪些位置
+      preview: picked.list.slice(0, 40).map((r) => ({
+        id: r.id, title: r.title, type: r.type, status: r.status, cover: r.cover,
+        percent: completeness(r).percent,
+        blanks: blankFields(r).map((k) => ({ key: k, label: (GAP_FIELDS.find((f) => f.key === k) || {}).label || k })),
+        urls: candidateUrls(r, { limit: 3 }),
+      })),
+      filters: picked.filters,
+    };
+  });
+
+  /**
+   * 批量补全资源里缺失的空白位置：抓取资源自带链接（可选再联网检索），
+   * 只填还空着的位置，已有内容一律不动；单批最多 30 条，前端循环跑完整库。
+   * scope=filter 时按后台列表同一套筛选条件取「最不完整」的一批。
+   */
+  route('POST', /^\/api\/admin\/enrich-batch$/, async ({ req, res, body, query }) => {
+    if (!guard(res, req)) return;
+    const fields = (Array.isArray(body.fields) && body.fields.length ? body.fields : GAP_KEYS).filter((k) => GAP_KEYS.includes(k));
+    if (!fields.length) return json(res, 400, { ok: false, message: '请至少选择一个要补全的位置' });
+    const dryRun = !!body.dryRun;
+    const ids = (Array.isArray(body.ids) && body.ids.length ? body.ids : csvParam(query.get('ids'))).map(String).filter(Boolean);
+    const filter = body.filter && typeof body.filter === 'object' ? body.filter : {};
+    let pool = [];
+    let missingIds = [];
+    if (ids.length) {
+      pool = ids.map((id) => store.findResource(id)).filter(Boolean);
+      missingIds = ids.filter((id) => !pool.some((r) => r.id === id));
+    } else {
+      pool = applyResourceFilter(query, filter).list;
+    }
+    // 只处理「勾到的位置里至少有一个还空着」的资源
+    const targets = pool.filter((r) => fields.some((k) => isBlank(r, k)));
+    const limit = clampInt(body.limit, 1, 30, ids.length || 8);
+    const batch = body.reverse ? targets.slice(-limit) : targets.slice(0, limit);
+    const started = Date.now();
+    const report = await batchFill(store, batch, {
+      fields,
+      uploadDir: UPLOADS,
+      // 预览不镜像图片，避免「只是看看能补什么」就往磁盘写文件
+      mirrorImages: dryRun ? false : (body.mirror === undefined ? !!store.db.settings.mirrorImagesByDefault : !!body.mirror),
+      imageLimit: clampInt(body.imageLimit, 1, 12, 4),
+      timeout: clampInt(body.timeout, 2000, 15000, 8000),
+      maxUrls: clampInt(body.maxUrls, 1, 6, 3),
+      concurrency: clampInt(body.concurrency, 1, 4, 2),
+      useSearch: body.useSearch === undefined ? true : !!body.useSearch,
+      allowLinks: !!body.allowLinks,
+      sources: store.db.sources,
+      actor: sessionUser(req),
+      dryRun,
+      store,
+    });
+    if (!dryRun && report.changed) recomputeCounts();
+    if (!dryRun) {
+      store.log('enrich', '批量补全：' + report.changed + ' 条写入 / 共 ' + report.cells + ' 个位置（本批 ' + batch.length + ' 条）', { fields, remaining: targets.length - batch.length });
+      await store.save();
+    }
+    return {
+      report,
+      dryRun,
+      scope: ids.length ? 'ids' : 'filter',
+      fields,
+      scanned: batch.length,
+      matched: targets.length,
+      remaining: Math.max(0, targets.length - batch.length),
+      missing: missingIds,
+      ids: batch.map((r) => r.id),
+      ms: Date.now() - started,
+      message: dryRun
+        ? '预览完成：' + report.cells + ' 个空白位置可以补，涉及 ' + report.changed + ' 条资源'
+        : '本批补全 ' + report.cells + ' 个空白位置，写入 ' + report.changed + ' 条资源',
+    };
+  });
+
+  /** 后台列表同一套筛选条件（gaps / enrich-batch 共用）；支持 override.q / status / type / onlyBlank / ids */
+  function applyResourceFilter(query, override = {}) {
+    const param = (key) => {
+      if (override[key] !== undefined && override[key] !== null) return String(override[key]);
+      if (query && typeof query.get === 'function') return String(query.get(key) || '');
+      return '';
+    };
+    const q = (override.q !== undefined && override.q !== null ? String(override.q) : param('q')).trim().toLowerCase();
+    const status = (override.status !== undefined && override.status !== null ? String(override.status) : param('status')) || 'all';
+    const type = (override.type !== undefined && override.type !== null ? String(override.type) : param('type')) || '';
+    const onlyIds = Array.isArray(override.ids) && override.ids.length ? override.ids.map(String) : null;
+    let list = onlyIds ? store.db.resources.filter((r) => onlyIds.includes(r.id)) : store.db.resources.slice();
+    if (status !== 'all') list = list.filter((r) => (r.status || 'published') === status);
+    if (type) list = list.filter((r) => r.type === type);
+    if (q) list = list.filter((r) => ((r.title || '') + ' ' + (r.tags || []).join(' ') + ' ' + (r.summary || '')).toLowerCase().includes(q));
+    const onlyBlank = override.onlyBlank === undefined ? true : !!override.onlyBlank;
+    if (onlyBlank) list = list.filter((r) => blankFields(r).length);
+    list.sort((a, b) => completeness(a).percent - completeness(b).percent || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    return { list, total: list.length, ids: list.map((r) => r.id), filters: { q, status, type, onlyBlank } };
+  }
+  const csvParam = (v) => String(v || '').split(/[,，|\s]+/).map((s) => s.trim()).filter(Boolean).slice(0, 200);
+
   route('GET', /^\/api\/admin\/archive$/, ({ req, res }) => {
     if (!guard(res, req)) return;
     return { items: store.db.archive.slice().reverse().map((a) => ({ at: a.at, id: a.resource.id, title: a.resource.title, type: a.resource.type, cover: a.resource.cover, status: a.resource.status })) };
@@ -169,6 +281,9 @@ export function registerAdmin(ctx) {
     from: s.contact || (s.kind === 'source' ? '访客补源' : '匿名'),
     resourceTitle: s.resourceTitle || (s.resourceId ? (store.findResource(s.resourceId) || {}).title || '' : ''),
     completeness: completeness(s),
+    inserts: Array.isArray(s.inserts) ? s.inserts : [],
+    insertLabels: (Array.isArray(s.inserts) ? s.inserts : []).map((i) => FIELD_LABEL[i && i.field] || i && i.field).filter(Boolean),
+    targetTitle: s.resourceId ? ((store.findResource(s.resourceId) || {}).title || s.resourceTitle || '') : (s.resourceTitle || ''),
     draft: {
       title: s.title, type: s.type, tags: s.tags || [], score: s.score,
       summary: s.summary, content: s.content, cover: s.cover, gallery: [],
@@ -202,6 +317,37 @@ export function registerAdmin(ctx) {
     if (action === 'approve' || action === 'publish') {
       const merged = { ...sub, ...(body.patch || {}) };
       delete merged.id; delete merged.status; delete merged.at;
+      // 内容补充类投稿（详情页「找更多来源」点选插入）：按同样规则写回原资源的对应位置
+      if (sub.kind === 'patch') {
+        const target = store.findResource(sub.resourceId || '') || store.db.resources.find((x) => normalizeLoose(x.title) === normalizeLoose(sub.title));
+        if (!target) {
+          store.updateSubmission(sub.id, { status: 'rejected', reviewNote: '原资源已不存在，无法写入' });
+          store.log('submission', '内容补充失败（原资源不存在）：' + sub.title, { id: sub.id });
+          await store.save();
+          return json(res, 400, { ok: false, message: '原资源已不存在，无法写入' });
+        }
+        // 可只写入勾选的那几条（body.inserts 为子集）；「仅通过」= 标记已处理但不写库
+        const chosen = Array.isArray(body.inserts) && body.inserts.length ? body.inserts : (sub.inserts || []);
+        const inserts = action === 'approve' ? [] : chosen;
+        const out2 = inserts.length
+          ? store.insertInto(target.id, inserts, { actor: sessionUser(req), overwrite: !!body.overwrite, source: (body.source || sub.note || '访客补录') })
+          : { applied: false, report: { filled: [], appended: [], skipped: [], duplicate: [], invalid: [] }, resource: target, completeness: completeness(target) };
+        if (!out2) return json(res, 404, { ok: false, message: '原资源不存在' });
+        store.updateSubmission(sub.id, { status: 'approved', resourceId: target.id, inserts: chosen, appliedInserts: out2.applied ? inserts.length : 0, reviewNote: String(body.note || '').slice(0, 200) });
+        recomputeCounts();
+        const names = [...(out2.report.filled || []), ...(out2.report.appended || [])].map((x) => x.label).join('、');
+        store.log('submission', '内容补充并入：' + target.title + (names ? '（' + names + '）' : '（无新增）'), { id: sub.id, resourceId: target.id, written: inserts.length });
+        await store.save();
+        return {
+          resource: out2.resource,
+          report: out2.report,
+          completeness: out2.completeness,
+          inserts: chosen,
+          message: action === 'approve'
+            ? '已标记通过（未写入任何内容）'
+            : out2.applied ? '已写入《' + target.title + '》：' + names : '《' + target.title + '》里已有这些内容，未重复写入',
+        };
+      }
       // 来源补充类投稿：不新建资源、不按标题猜，直接把链接并进原条目（内部按 URL 去重）
       if (sub.kind === 'source') {
         const target = store.findResource(sub.resourceId || '') || store.db.resources.find((x) => x.title === sub.title);
@@ -379,7 +525,7 @@ export function registerAdmin(ctx) {
   // ---- 站点设置 ----
   route('GET', /^\/api\/admin\/settings$/, ({ req, res }) => {
     if (!guard(res, req)) return;
-    return { settings: store.db.settings, publicSettings: publicSettings(), admin: { user: store.db.admin.user, hasDefaultSecret: store.db.admin.isDefault !== false } };
+    return { settings: store.db.settings, publicSettings: publicSettings(), session: sessionView ? sessionView(req) : null, admin: { user: store.db.admin.user, hasDefaultSecret: store.db.admin.isDefault !== false } };
   });
   route('PATCH', /^\/api\/admin\/settings$/, async ({ req, res, body }) => {
     if (!guard(res, req)) return;
@@ -602,6 +748,11 @@ export function registerAdmin(ctx) {
     return out.filter((o) => o.ok).map((o) => o.value);
   }
 }
+
+const FIELD_LABEL = {
+  title: '标题', type: '类型', tags: '标签', score: '分数', summary: '简介', content: '内容/正文',
+  cover: '封面图', gallery: '图集', downloads: '资源下载', others: '其他来源', sourceUrl: '来源地址', meta: '资源信息', notes: '备注', image: '图片',
+};
 
 function extractImagesLocal(text = '') {
   return uniq(text.match(/https?:\/\/[^\s"'<>]+\.(?:png|jpe?g|webp|gif|avif|bmp)(?:\?[^\s"'<>]*)?/gi) || []);

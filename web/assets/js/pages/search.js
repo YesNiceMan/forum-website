@@ -1,5 +1,6 @@
 /* 聚合搜索：站内 + 网盘 / 网站 / 磁力 多来源 */
 import { $, el, escapeHtml, Api, store, skeletonGrid, reveal, toast, copy, openLink, providerInitial, fmtBytes, relTime, navigate, emptyState, modal, Prefs, rippleAll } from '../core.js';
+import { pickStrip, openInsertPanel, piecesOfItem, onResourceChange } from './insert.js';
 
 const KINDS = [
   { key: 'all', name: '全部', icon: '◎' },
@@ -27,13 +28,24 @@ export async function search(host, ctx) {
     '<span class="grow"></span><span class="mono tiny muted">来源：' + store.bootstrap.sources.length + ' 个</span>',
     '</div>',
     '</form>',
-    bindId ? '<div class="hint-strip" style="margin-top:14px"><span style="flex:none">⤴</span><span>正在为《<b id="bindTitle">…</b>》查找补充来源。每条结果都能点「加入该资源」直接并入；<span id="bindNote">正在确认站点设置…</span></span></div>' : '',
+    bindId ? '<div class="hint-strip hint-strip--bind" style="margin-top:14px"><span style="flex:none">⤴</span><span>正在为《<b id="bindTitle">…</b>》查找补充来源：<b>点结果里的文字 / 图片小块，就直接插进它的对应位置</b>（简介 / 正文 / 封面 / 图集 / 下载 / 其他来源 / 元数据），要改落点或一次插多条就点「✚ 选位置插入」。<span id="bindNote">正在确认站点设置…</span></span><span class="grow"></span><span class="bind-count" id="bindCount" hidden>本次已插入 <b>0</b> 项</span></div>' : '',
     '<div id="aggBody" style="margin-top:22px"></div>',
     '</div>',
   ].join('');
 
   const body = host.querySelector('#aggBody');
-  const state = { kinds: ['all'], sources: [] };
+  // ?sources=site,github 可只看指定来源（资源页「找更多来源」默认锁定「本站 + 全部」）
+  const state = { kinds: ['all'], sources: String(ctx.query.sources || '').split(',').map((s) => s.trim()).filter(Boolean) };
+  let bound = null;              // 绑定模式下的资源快照：插入后由服务端回传刷新
+  let insertedCount = 0;
+  const bumpCount = () => {
+    const node = host.querySelector('#bindCount');
+    if (!node || !insertedCount) return;
+    node.hidden = false;
+    node.querySelector('b').textContent = String(insertedCount);
+  };
+  // 每次写入后服务端会回传资源快照：更新本地快照，后续芯片的「空位 / 追加」判定立即跟上
+  if (bindId) onResourceChange((id, snapshot) => { if (!snapshot || (id && id !== bindId)) return; bound = { ...bound, ...snapshot }; boundResource = bound; });
   host.querySelector('#kindRow').onclick = (e) => {
     const btn = e.target.closest('[data-kind]');
     if (!btn) return;
@@ -53,11 +65,12 @@ export async function search(host, ctx) {
       const d = await Api.resource(bindId);
       const t = host.querySelector('#bindTitle');
       if (t) t.textContent = d.resource.title;
-      joinTitles[bindId] = d.resource.title;
+      bound = d.resource;
+      boundResource = d.resource;
       const note = host.querySelector('#bindNote');
-      if (note) note.textContent = (store.bootstrap.settings || {}).requireReview
-        ? '本站开启了审核：提交后先进待审队列，管理员确认后才并入。'
-        : '本站允许直接入库：并入后立刻出现在「资源下载 / 其他来源」里。';
+      note.textContent = (store.bootstrap.settings || {}).requireReview
+        ? '本站开启了审核：访客插入先进待审队列，管理员确认后才并入。'
+        : '本站允许直接入库：点一下就能看到内容出现在资源的对应位置里。';
     } catch {
       const t = host.querySelector('#bindTitle');
       if (t) t.textContent = '未知资源';
@@ -87,7 +100,7 @@ export async function search(host, ctx) {
     store.recentSearches = [query, ...(store.recentSearches || []).filter((x) => x !== query)].slice(0, 10);
     body.innerHTML = '<div class="row muted" style="margin-bottom:16px"><span class="spinner"></span><span class="small">正在并发检索 ' + store.bootstrap.sources.length + ' 个来源…</span></div>' + skeletonGrid(4, true);
     try {
-      const res = await Api.search({ q: query, kinds: state.kinds, limit: 12 });
+      const res = await Api.search({ q: query, kinds: state.kinds, sources: state.sources, limit: 12 });
       renderResults(res, query);
     } catch (err) {
       body.innerHTML = emptyState({ icon: '⚠️', title: '检索失败', desc: escapeHtml(err.message || '服务异常'), action: '<button class="btn btn--sm btn--quiet" onclick="location.reload()">重试</button>' });
@@ -124,7 +137,10 @@ export async function search(host, ctx) {
       const group = el('<section class="group"><div class="group__head"><span class="badge group__badge" style="--tc:' + gcolor + '">' + escapeHtml(g.icon || '◎') + ' ' + escapeHtml(g.name) + '</span><span class="tiny mono muted">' + (g.ok ? g.items.length + ' 条 · ' + g.ms + 'ms' : '失败') + '</span><span class="group__bar"></span></div><div class="dl-list" id="g-' + escapeHtml(g.id) + '"></div></section>');
       const list = group.querySelector('.dl-list');
       if (g.error) list.innerHTML = '<div class="hint-strip bad-strip tiny">该来源未返回结果：' + escapeHtml(g.error) + '</div>';
-      g.items.slice(0, 12).forEach((it) => list.append(resultRow(it, query, bindId)));
+      g.items.slice(0, 12).forEach((it) => {
+        if (bindId && bound) list.append(resultBlock(it, query, bound, () => { insertedCount++; bumpCount(); }));
+        else list.append(resultRow(it, query, bindId));
+      });
       frag.append(group);
     });
     body.innerHTML = '';
@@ -133,6 +149,8 @@ export async function search(host, ctx) {
     rippleAll(body);
   }
 }
+
+let boundResource = null;   // 绑定模式下的资源快照（resultBlock 写入，resultRow 读取）
 
 function resultRow(it, query, bindId) {
   const row = el('<div class="result" data-reveal><div class="result__thumb">' + (it.image ? '<img src="' + escapeHtml(it.image) + '" alt="" loading="lazy" referrerpolicy="no-referrer" />' : escapeHtml(providerInitial(it.title || '?'))) + '</div><div class="grow" style="min-width:0"><h4 class="truncate"></h4><div class="result__meta"></div></div><div class="row" style="gap:6px"></div></div>');
@@ -154,12 +172,12 @@ function resultRow(it, query, bindId) {
     acts.append(mk('打开', bindId ? 'btn--quiet' : 'btn--primary', () => openLink(it.url)));
     acts.append(mk('复制', 'btn--quiet', () => copy(it.url, '链接已复制')));
     if (bindId) {
-      // 任何来源（网页 / 文档 / 磁力 / 网盘）都能补充，服务端按类型自动归到下载或其他来源
-      const done = joinMark(bindId, it.url);
-      const label = done === 'appended' ? '✓ 已加入' : done === 'duplicate' ? '已存在' : done === 'pending' ? '待审核' : '加入该资源';
-      const btn = mk(label, done ? 'btn--quiet' : 'btn--primary', (e) => joinResource(e.currentTarget, it, bindId),
-        done ? '你已经提交过这条来源' : '把这条来源并入《' + (joinTitles[bindId] || '该资源') + '》');
-      if (done) { btn.disabled = true; btn.classList.add('is-done'); }
+      // 绑定模式下给「整套插入」入口：文字 / 图片 / 链接一起挑落点
+      const btn = mk('✚ 插入到资源', 'btn--primary', () => {
+        const pieces = piecesOfItem(it, bindId);
+        if (!pieces.length) return toast('这条结果里没有可提取的文字 / 图片，试试「⇣ 抓正文与图片」', 'warn', 4200);
+        openInsertPanel({ item: it, resource: boundResource || {}, pieces, onPanelClose: () => onInserted && onInserted() });
+      }, '把这条结果里的文字 / 图片 / 链接挑几条写进资源');
       acts.append(btn);
     } else if (['netdisk', 'magnet', 'ed2k', 'thunder', 'direct'].includes(it.kind)) {
       acts.append(mk('补全入库', 'btn--quiet', () => quickAdd(it), '生成一条待审投稿，管理员补全后入库'));
@@ -168,43 +186,24 @@ function resultRow(it, query, bindId) {
   return row;
 }
 
-/* 「加入该资源」的提交状态：按 资源 id + URL 记一份，回来翻页不至于重复点 */
-const JOIN_KEY = 'aurora.joins';
-const joinState = (() => { try { return JSON.parse(localStorage.getItem(JOIN_KEY) || '{}') || {}; } catch { return {}; } })();
-const joinTitles = {};
-function joinMark(bindId, url) { return joinState[bindId + '|' + url]; }
-function joinSave(bindId, url, mode) {
-  const key = bindId + '|' + url;
-  joinState[key] = mode;
-  const keys = Object.keys(joinState);
-  if (keys.length > 500) keys.slice(0, keys.length - 500).forEach((k) => delete joinState[k]);
-  try { localStorage.setItem(JOIN_KEY, JSON.stringify(joinState)); } catch {}
-}
-async function joinResource(btn, it, bindId) {
-  if (btn.disabled || btn.dataset.busy) return;
-  btn.dataset.busy = '1';
-  const label = btn.textContent;
-  btn.textContent = '提交中…';
-  try {
-    const res = await Api.contribute(bindId, {
-      url: it.url,
-      label: it.title && it.title !== it.url ? String(it.title).slice(0, 60) : '',
-      code: it.code || '',
-      size: it.size ? fmtBytes(it.size) : '',
-      note: '来自聚合搜索 · ' + (it.providerName || it.sourceName || '外部来源'),
-    });
-    const mode = res.mode === 'appended' ? 'appended' : res.mode === 'duplicate' ? 'duplicate' : 'pending';
-    joinSave(bindId, it.url, mode);
-    btn.textContent = mode === 'appended' ? '✓ 已加入' : mode === 'duplicate' ? '已存在' : '待审核';
-    btn.classList.remove('btn--primary');
-    btn.classList.add('btn--quiet', 'is-done');
-    btn.disabled = true;
-    toast(res.message || (mode === 'pending' ? '已提交，等待管理员并入' : '已加入该资源'), mode === 'pending' ? 'info' : 'ok', 4200);
-  } catch (err) {
-    btn.textContent = label;
-    delete btn.dataset.busy;
-    toast('加入失败：' + (err.message || '服务异常'), 'bad', 4600);
-  }
+/**
+ * 绑定模式（详情页「找更多来源」跳过来）的一整块：
+ * 结果行 + 点选插入芯片条。芯片一点就写进资源的对应位置，行内的按钮打开「选位置插入」面板。
+ */
+function resultBlock(it, query, resource, onInserted) {
+  boundResource = resource;
+  const wrap = el('<div class="result-block"></div>');
+  wrap.append(resultRow(it, query, resource.id));
+  const strip = pickStrip(it, resource, {
+    onDone: (res) => {
+      if (res && res.mode === 'inserted' && res.report) {
+        const n = (res.report.filled || []).length + (res.report.appended || []).length;
+        if (n) onInserted && onInserted(n);
+      } else if (res && res.mode === 'pending') onInserted && onInserted(1);
+    },
+  });
+  wrap.append(strip);
+  return wrap;
 }
 
 async function quickAdd(it) {

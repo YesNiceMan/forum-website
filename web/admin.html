@@ -37,6 +37,7 @@
         <button class="btn btn--sm btn--quiet" id="logoutBtn" type="button">退出</button>
       </div>
       <p class="tiny mono muted" style="margin-top:10px" id="adminVersion">AURORA VAULT</p>
+      <p class="tiny mono muted" style="margin-top:4px" id="sessionNote" title="后台活动时会自动续期">会话：未登录</p>
     </div>
   </aside>
 
@@ -65,7 +66,9 @@
     <form id="loginForm" autocomplete="on">
       <div class="field"><label>账号</label><input class="input" id="loginUser" value="admin" autocomplete="username" /></div>
       <div class="field" style="margin-top:12px"><label>口令</label><input class="input" id="loginPass" type="password" placeholder="默认 aurora888" autocomplete="current-password" /></div>
+      <label class="login-remember"><input type="checkbox" class="check" id="loginRemember" checked /><span>记住登录 30 天 · 刷新 / 重启服务 / 切回前台再回来都不用重登</span></label>
       <button class="btn btn--primary btn--block" style="margin-top:16px" type="submit">登录控制台</button>
+      <p class="tiny muted login-note" id="loginNote">会话令牌写在签名 Cookie 里，只跟浏览器绑定。</p>
     </form>
     <p class="tiny muted" style="margin-top:14px">连续错误 6 次会临时锁定 5 分钟 · <a class="link-quiet" href="/">返回前台</a></p>
   </div>

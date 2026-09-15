@@ -25,8 +25,23 @@
 3、在找更多来源中, 补充来源的结果无法加入该资源
 4、帖子会被重复打分
 
+
+三、项目优化
+1、当前项目上传到github，部署到vercel上Application Preset选择的Node，部署中报错“Error: No entrypoint found in "/vercel/path0". Set package.json "main" to a server file, or add one of: app.js, app.cjs, app.mjs, app.ts, app.cts, app.mts, index.js, index.cjs, index.mjs, index.ts, index.cts, index.mts, server.js, server.cjs, server.mjs, server.ts, server.cts, server.mts, main.js, main.cjs, main.mjs, main.ts, main.cts, main.mts, src/app.js, src/app.cjs, src/app.mjs, src/app.ts, src/app.cts, src/app.mts, src/index.js, src/index.cjs, src/index.mjs, src/index.ts, src/index.cts, src/index.mts, src/server.js, src/server.cjs, src/server.mjs, src/server.ts, src/server.cts, src/server.mts, src/main.js, src/main.cjs, src/main.mjs, src/main.ts, src/main.cts, src/main.mts
+”
+
+
+四、项目优化
+1、从资源中点击“找更多来源”，点击获取到的文字、图片等信息，可以直接插入到资源的对应位置
+2、后台可以批量补全资源中缺失的空白位置
+3、优化后台只要刷新或切换到前台后返回都要重新登录的设置
+
+
+4、更新网站的UI图标库
+
 优化检索来源设置
-—————————————————————————————————————————————
+
+——————————————-—————————————————————————————
 2中的
 一、项目优化
 1、后台独立面板，能够管理内容、标签等操作

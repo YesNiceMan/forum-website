@@ -122,6 +122,49 @@
 .admin-login__mark svg { width: 54px; height: 54px; }
 .admin-login__card h1 { font-size: 21px; margin: 12px 0 4px; }
 .admin-login__card form { text-align: left; margin-top: 20px; }
+.admin-login .login-remember { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; font-size: 12.5px; line-height: 1.5; color: var(--text-dim); cursor: pointer; }
+.admin-login .login-remember .check { margin-top: 1px; }
+.admin-login .login-note { margin: 10px 0 0; text-align: center; }
+.admin-side__foot #sessionNote { letter-spacing: .02em; }
+
+/* 内容补充投稿：卡片上的位置标签 */
+.sub-inserts { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 16px 12px; }
+.sub-insert-list { display: grid; gap: 8px; max-height: 46vh; overflow: auto; padding-right: 4px; }
+
+/* ============ 批量补全空白 ============ */
+.gap-layout { display: grid; grid-template-columns: minmax(0, 366px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.gap-col { display: grid; gap: 16px; align-content: start; }
+.gap-grp { margin-top: 12px; }
+.gap-grp:first-child { margin-top: 0; }
+.gap-grp__title { font: 700 10.5px/1 var(--font-mono); letter-spacing: .14em; color: var(--text-mute); margin-bottom: 8px; }
+.gap-field { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 11px; border: 1px solid transparent; cursor: pointer; transition: background var(--dur-2), border-color var(--dur-2); }
+.gap-field:hover { background: var(--hover); border-color: var(--line); }
+.gap-field.is-on { background: var(--accent-soft); border-color: var(--accent-line); }
+.gap-field b { font-size: 13px; font-weight: 600; }
+.gap-field .gap-count { margin-left: auto; font: 700 11px/1 var(--font-mono); padding: 4px 7px; border-radius: 7px; background: var(--veil-2); color: var(--text-mute); }
+.gap-field.is-on .gap-count { background: var(--accent); color: var(--on-accent); }
+.gap-field.is-zero .gap-count { opacity: .45; }
+.gap-run { display: grid; gap: 10px; }
+.gap-run__stat { display: flex; flex-wrap: wrap; gap: 8px 14px; font: 600 11.5px/1.4 var(--font-mono); color: var(--text-mute); }
+.gap-run__stat b { color: var(--text); font-weight: 800; }
+.gap-run__bar { position: relative; }
+.gap-run__pct { position: absolute; right: 0; top: -16px; font: 700 10.5px/1 var(--font-mono); color: var(--accent-text); }
+.gap-log { display: grid; gap: 7px; max-height: 420px; overflow: auto; padding-right: 4px; }
+.gap-item { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 11px; border-radius: 12px; border: 1px solid var(--line); background: var(--veil-1); }
+.gap-item.is-ok { border-color: color-mix(in srgb, var(--green) 34%, transparent); }
+.gap-item.is-none { opacity: .74; }
+.gap-item__mark { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 8px; background: var(--veil-2); font-size: 12px; }
+.gap-item.is-ok .gap-item__mark { background: color-mix(in srgb, var(--green) 18%, transparent); color: color-mix(in srgb, var(--green) 70%, #fff); }
+html[data-theme="light"] .gap-item.is-ok .gap-item__mark { color: color-mix(in srgb, var(--green) 62%, #000); }
+.gap-item__title { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gap-item__meta { font: 500 11px/1.5 var(--font-mono); color: var(--text-mute); }
+.gap-item__tags { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; max-width: 260px; }
+.gap-tag { font: 600 10.5px/1 var(--font-mono); padding: 4px 6px; border-radius: 6px; background: var(--veil-2); color: var(--text-dim); }
+.gap-tag.is-skip { background: color-mix(in srgb, var(--amber) 14%, transparent); color: color-mix(in srgb, var(--amber) 72%, #000); }
+.gap-tag.is-mirror { background: color-mix(in srgb, var(--cyan) 14%, transparent); color: color-mix(in srgb, var(--cyan) 60%, #000); }
+.gap-preview { width: 34px; height: 34px; border-radius: 9px; object-fit: cover; background: var(--veil-2); display: grid; place-items: center; font: 700 11px/1 var(--font-mono); color: var(--text-mute); overflow: hidden; flex: none; }
+.gap-preview img { width: 100%; height: 100%; object-fit: cover; }
+@media (max-width: 1180px) { .gap-layout { grid-template-columns: minmax(0, 1fr); } }
 @media (prefers-reduced-motion: reduce) {
   .admin *, .admin *::after, .admin *::before { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }

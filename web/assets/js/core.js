@@ -162,12 +162,14 @@ export const Api = {
   favorite: (id, on) => api('POST', '/api/resources/' + encodeURIComponent(id) + '/favorite', on === undefined ? {} : { on }, { silent: true }),
   // 补源是「点了就该看到结果」的操作，给 15s 兜底，超时还原按钮而不是永远转圈
   contribute: (id, payload) => api('POST', '/api/resources/' + encodeURIComponent(id) + '/contribute', payload, { timeoutMs: 15000 }),
+  // 「找更多来源」点选插入：把文字 / 图片 / 链接写进资源的对应位置（管理员直接写，访客按设置走待审）
+  insert: (id, payload) => api('POST', '/api/resources/' + encodeURIComponent(id) + '/insert', payload, { timeoutMs: 25000, dedupe: false }),
   detect: (text) => api('POST', '/api/detect', { text }),
   enrich: (urls, mirror) => api('POST', '/api/enrich', { urls, mirror }),
   search: (payload) => api('POST', '/api/search', payload),
   submit: (draft) => api('POST', '/api/submit', draft),
   session: () => api('GET', '/api/admin/session', null, { silent: true, dedupe: false }),
-  login: (user, pass) => api('POST', '/api/admin/login', { user, pass }),
+  login: (user, pass, remember) => api('POST', '/api/admin/login', { user, pass, remember: !!remember }),
   logout: () => api('POST', '/api/admin/logout', {}),
   admin: {
     overview: () => api('GET', '/api/admin/overview'),
@@ -178,6 +180,9 @@ export const Api = {
     remove: (id) => api('DELETE', '/api/admin/resources/' + encodeURIComponent(id)),
     bulk: (body) => api('POST', '/api/admin/resources/bulk', body),
     checkLinks: (id) => api('POST', '/api/admin/resources/' + encodeURIComponent(id) + '/check-links', {}),
+    // 缺失空白位置一览 + 批量补全（单批最长几分钟，不掐客户端超时，交给服务端）
+    gaps: (query = {}) => api('GET', '/api/admin/gaps?' + new URLSearchParams(query).toString()),
+    enrichBatch: (body) => api('POST', '/api/admin/enrich-batch', body, { dedupe: false }),
     archive: () => api('GET', '/api/admin/archive'),
     restore: (id) => api('POST', '/api/admin/archive/' + encodeURIComponent(id) + '/restore', {}),
     submissions: (status) => api('GET', '/api/admin/submissions?status=' + encodeURIComponent(status || 'all')),

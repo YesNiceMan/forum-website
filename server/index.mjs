@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { readFile, stat, mkdir, copyFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 
@@ -106,6 +106,18 @@ function rateOk(key, perWindow = 30, windowMs = 60000) {
 }
 
 // ---------- 会话 ----------
+/**
+ * 会话令牌是自包含的签名串（HMAC-SHA256），不再依赖「某一台实例的某一份 db.json」。
+ * 旧实现只在库里存一个随机 sid，于是这三种情况都会「刷新即掉线」：
+ *   1) 本地重启 / npm run dev（--watch）—— 读库时 sessions 被重置成空表；
+ *   2) Vercel 冷启动 —— /tmp 被清空，sid 找不回来；
+ *   3) 多实例 / 频繁扩缩容 —— A 实例发的 cookie 到 B 实例查无此人。
+ * 现在令牌自带「谁、何时签发、能用到什么时候」，服务端只留一张吊销名册管退出登录；
+ * 库里的 sessions 退化成「在线会话」视图，丢了也不影响继续登录。
+ */
+const SESSION_COOKIE = 'aurora_sid';
+const SESSION_TTL_MS = 12 * 3600 * 1000;          // 默认 12 小时
+const REMEMBER_TTL_MS = 30 * 24 * 3600 * 1000;    // 勾选「记住登录」= 30 天
 function cookie(req, name) {
   const raw = req.headers.cookie || '';
   for (const part of raw.split(';')) {
@@ -114,33 +126,110 @@ function cookie(req, name) {
   }
   return '';
 }
+const b64url = (s) => Buffer.from(String(s), 'utf8').toString('base64url');
+const unb64url = (s) => { try { return Buffer.from(String(s), 'base64url').toString('utf8'); } catch { return ''; } };
+/** 签名密钥 = 口令 salt（改口令即全体作废）+ 可选的部署级固定密钥（多实例共享同一密钥） */
+function sessionSecret() {
+  return createHash('sha256')
+    .update((process.env.AURORA_SESSION_SECRET || '') + '|' + (store.db.admin.secret || '') + '|aurora-session-v1')
+    .digest();
+}
+function issueToken(user, ttlMs) {
+  const now = Date.now();
+  const payload = { u: user, j: randomUUID().replace(/-/g, ''), iat: now, exp: now + ttlMs, ttl: ttlMs, r: ttlMs > SESSION_TTL_MS ? 1 : 0 };
+  const body = b64url(JSON.stringify(payload));
+  const sig = createHmac('sha256', sessionSecret()).update(body).digest('base64url');
+  return body + '.' + sig;
+}
+function verifyToken(token) {
+  const full = String(token || '');
+  const dot = full.indexOf('.');
+  if (dot < 0) return null;
+  const body = full.slice(0, dot);
+  const sig = full.slice(dot + 1);
+  const want = Buffer.from(createHmac('sha256', sessionSecret()).update(body).digest('base64url'), 'utf8');
+  const got = Buffer.from(sig, 'utf8');
+  if (want.length !== got.length || !timingSafeEqual(want, got)) return null;
+  let p;
+  try { p = JSON.parse(unb64url(body)); } catch { return null; }
+  if (!p || typeof p.u !== 'string' || !Number(p.exp)) return null;
+  if (p.exp < Date.now()) return null;
+  // 改口令 / 一键下线：按签发时间整批作废；退出登录：按 jti 单个作废
+  if ((Number(store.db.admin.invalidBefore) || 0) > Number(p.iat || 0)) return null;
+  if (isRevoked(p.j)) return null;
+  return { sid: p.j, user: p.u, created: Number(p.iat) || 0, expires: Number(p.exp) || 0, last: Date.now(), ttl: Number(p.ttl) || SESSION_TTL_MS, remember: !!p.r };
+}
+function isRevoked(jti) {
+  const list = store.db.admin.revoked || [];
+  return list.some((r) => r.j === jti);
+}
+function revoke(jti, exp) {
+  if (!jti) return;
+  const list = (store.db.admin.revoked || (store.db.admin.revoked = []));
+  if (!list.some((r) => r.j === jti)) list.push({ j: jti, exp: Number(exp) || Date.now() + REMEMBER_TTL_MS });
+  const now = Date.now();
+  store.db.admin.revoked = list.filter((r) => r.exp > now).slice(-200);
+  store.save();
+}
 function sessionOf(req) {
-  const sid = cookie(req, 'aurora_sid') || req.headers['x-aurora-session'] || '';
-  if (!sid) return null;
-  const s = store.db.admin.sessions[sid];
-  if (!s) return null;
-  if (s.expires < Date.now()) {
-    delete store.db.admin.sessions[sid];
+  const raw = (req && req.headers && (cookie(req, SESSION_COOKIE) || req.headers['x-aurora-session'])) || '';
+  if (!raw) return null;
+  if (raw.indexOf('.') > 0) return verifyToken(raw);
+  // 升级前的随机 sid cookie：库里查得到就继续放行（下次登录自动换成签名令牌）
+  const legacy = (store.db.admin.sessions || {})[raw];
+  if (!legacy) return null;
+  if (legacy.expires < Date.now()) {
+    delete store.db.admin.sessions[raw];
     store.save();
     return null;
   }
-  return { sid, ...s };
+  return { sid: raw, user: legacy.user, created: legacy.created || Date.now(), expires: legacy.expires, last: legacy.last || Date.now(), ttl: SESSION_TTL_MS, remember: !!legacy.remember };
 }
-function createSession(user) {
-  const sid = randomUUID().replace(/-/g, '');
-  store.db.admin.sessions[sid] = { user, created: Date.now(), expires: Date.now() + 1000 * 60 * 60 * 12, last: Date.now() };
-  const sids = Object.entries(store.db.admin.sessions).filter(([, v]) => v.expires < Date.now()).map(([k]) => k);
-  for (const k of sids) delete store.db.admin.sessions[k];
+/** 给前端看的会话视图：只有「是不是登录了 / 用到什么时候」，不发令牌 */
+function sessionView(req) {
+  const s = sessionOf(req);
+  return { authed: !!s, user: s ? s.user : null, expires: s ? s.expires : 0, remember: s ? !!s.remember : false };
+}
+function createSession(user, options = {}) {
+  const ttl = options.remember ? REMEMBER_TTL_MS : SESSION_TTL_MS;
+  const token = issueToken(user, ttl);
+  const s = verifyToken(token);
+  const book = (store.db.admin.sessions || (store.db.admin.sessions = {}));
+  book[s.sid] = { user, created: s.created, expires: s.expires, last: Date.now(), remember: !!options.remember };
+  for (const [k, v] of Object.entries(book)) if (v.expires < Date.now()) delete book[k];
   store.save();
-  return sid;
+  return { token, ttl };
 }
-function setSession(res, sid) {
-  res.setHeader('set-cookie', 'aurora_sid=' + sid + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200');
+function secureFlag(req) {
+  const proto = String((req && req.headers && req.headers['x-forwarded-proto']) || '').split(',')[0].trim().toLowerCase();
+  return proto === 'https' ? '; Secure' : '';
 }
-function clearSession(res, sid) {
-  if (sid) delete store.db.admin.sessions[sid];
+function setSession(res, token, req, ttlMs = SESSION_TTL_MS) {
+  const maxAge = Math.max(1, Math.round((Number(ttlMs) || SESSION_TTL_MS) / 1000));
+  addCookie(res, SESSION_COOKIE + '=' + token + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=' + maxAge + secureFlag(req));
+}
+/**
+ * 滑动续期：只要还在用就把过期时间推回去（剩余不足 1/3 时续一次），
+ * 不会填表填到一半被踢下线；续期通过 Set-Cookie 完成，前端无感。
+ */
+function touchSession(req, res) {
+  const s = sessionOf(req);
+  if (!s || !(s.ttl > 0)) return s;
+  if (s.expires - Date.now() > s.ttl / 3) return s;
+  const next = s.remember ? REMEMBER_TTL_MS : SESSION_TTL_MS;
+  const token = issueToken(s.user, next);
+  if (res) setSession(res, token, req, next);
+  const n = verifyToken(token);
+  if (store.db.admin.sessions) store.db.admin.sessions[n.sid] = { user: n.user, created: n.created, expires: n.expires, last: Date.now(), remember: !!s.remember };
   store.save();
-  res.setHeader('set-cookie', 'aurora_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  return n;
+}
+function clearSession(req, res, sid) {
+  const s = sessionOf(req);
+  if (s) revoke(s.sid, s.expires);
+  if (sid && store.db.admin.sessions) delete store.db.admin.sessions[sid];
+  store.save();
+  addCookie(res, SESSION_COOKIE + '=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' + secureFlag(req));
 }
 /**
  * 访客身份：只用来判断「这台设备有没有投过票」。
@@ -200,9 +289,9 @@ function favResource(id, vid, on) {
   return { resource: r, liked: want, changed: want !== had };
 }
 function requireAdmin(req, res) {
-  const s = sessionOf(req);
+  const s = touchSession(req, res);
   if (!s) {
-    json(res, 401, { ok: false, error: 'unauthorized', message: '需要管理员登录' });
+    json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已过期，请在后台重新登录' });
     return null;
   }
   return s;
@@ -310,6 +399,9 @@ function toResponse(v) {
 route('GET', /^\/api\/bootstrap$/, ({ req, res }) => {
   // 首屏就发访客令牌，之后刷新页面也能知道自己那票还在不在
   visitorOf(req, res);
+  // 顺手给后台做滑动续期。这里原来是 sessionOf({ headers: {} })，永远读不到 Cookie，
+  // 于是后台每次刷新、或从前台切回来都判定「没登录」，只能重新输口令。
+  touchSession(req, res);
   return {
   settings: publicSettings(),
   types: store.db.types.map((t) => ({ key: t.key, name: t.name, color: t.color, icon: t.icon, count: t.count || 0 })),
@@ -326,7 +418,7 @@ route('GET', /^\/api\/bootstrap$/, ({ req, res }) => {
     sources: store.db.sources.filter((s) => s.enabled && s.mode !== 'url').length,
     jump: store.db.sources.filter((s) => s.enabled && s.mode === 'url').length,
   },
-  session: sessionOf({ headers: {} }),
+  session: sessionView(req),
   spotlight: store.db.resources
     .filter((r) => r.status === 'published')
     .sort((x, y) => (y.featured ? 1 : 0) - (x.featured ? 1 : 0) || (y.score || 0) - (x.score || 0))
@@ -444,6 +536,132 @@ route('POST', /^\/api\/resources\/([\w-]+)\/contribute$/, async ({ params, body,
   store.log('submission', '收到来源补充待审：' + r.title, { id: sub.id, resourceId: r.id, url });
   await store.save();
   return { mode: 'pending', field: into, submission: { id: sub.id }, message: '已提交，管理员确认后会并入《' + r.title + '》' };
+});
+
+/**
+ * 详情页「找更多来源」的写入接口：把在聚合搜索里点到的文字 / 图片
+ * 直接插进资源的对应位置（简介 / 正文 / 封面 / 图集 / 标签 / 下载 / 其他来源 / 元数据）。
+ * 管理员会话 -> 立即写入；访客 -> 按站点设置，走待审队列，后台点「应用」才落库。
+ */
+route('POST', /^\/api\/resources\/([\w-]+)\/insert$/, async ({ params, body, req, res, ip }) => {
+  const r = store.findResource(params[0]);
+  if (!r) return json(res, 404, { ok: false, message: '资源不存在或已删除' });
+  const rawInserts = body.inserts || body.insert || body;
+  const inserts = normalizeInserts(rawInserts);
+  // 白名单外的位置不静默丢弃：明确回传「这一格写不进去」
+  const dropped = droppedFields(rawInserts, inserts);
+  if (!inserts.length) return json(res, 400, { ok: false, message: '没有可插入的内容（请先选中要写入的文字或图片）' });
+  const sess = sessionOf(req);
+  const source = truncate(String(body.source || r.sourceName || '聚合搜索'), 60);
+  if (!sess && !store.db.settings.allowUserSubmit) return json(res, 403, { ok: false, message: '站点已关闭前台投稿' });
+  if (!rateOk('insert:' + (sess ? 'admin' : voteKey(ip || 'anon')), 24, 60000)) return json(res, 429, { ok: false, message: '插入过于频繁，请稍后再试' });
+  if (r.status !== 'published' && !sess) return json(res, 403, { ok: false, message: '该资源未发布，暂不接受补充' });
+  // 外链图片先镜像到本地再入库：省得资源里躺着一堆会被防盗链掐掉的地址
+  const mirrored = await mirrorInsertImages(inserts);
+  // 管理员、或站点关闭了审核 —— 直接写
+  if (sess || !store.db.settings.requireReview) {
+    const out = store.insertInto(r.id, mirrored, { actor: sess ? sess.user : 'visitor:' + (body.contact || '匿名'), overwrite: false, source });
+    if (!out) return json(res, 404, { ok: false, message: '资源不存在' });
+    if (dropped.length) out.report.invalid.push(...dropped);
+    if (!out.applied) {
+      return { mode: 'noop', report: out.report, message: '这些内容资源里已经有了，未重复写入', resource: resourceBrief(out.resource) };
+    }
+    recomputeCounts();
+    const fields = [...out.report.filled, ...out.report.appended, ...out.report.duplicate].map((x) => x.label || x.key).join('、');
+    store.log('resource', (sess ? '管理员' : '访客') + '插入来源内容：' + out.resource.title, { id: out.resource.id, fields, source });
+    store.track('insert', { id: out.resource.id });
+    await store.save();
+    return {
+      mode: 'inserted',
+      report: out.report,
+      completeness: out.completeness,
+      resource: resourceBrief(out.resource),
+      message: '已写入：' + (fields || '相关内容') + '（完整度 ' + out.completeness.percent + '%）' + (dropped.length ? '；' + dropped.map((d) => d.field).join('、') + ' 不是可写入的位置' : ''),
+    };
+  }
+  const sub = store.createSubmission({
+    kind: 'patch',
+    resourceId: r.id,
+    resourceTitle: r.title,
+    title: r.title,
+    type: r.type,
+    tags: [],
+    summary: '补充内容：' + inserts.map((i) => i.field).filter(Boolean).join(' / ').slice(0, 120),
+    contact: body.contact || '',
+    sourceUrl: String(body.pageUrl || '').slice(0, 300),
+    inserts: mirrored,
+    note: source,
+    ip,
+  });
+  store.log('submission', '收到内容补充待审：' + r.title, { id: sub.id, resourceId: r.id, fields: inserts.map((i) => i.field) });
+  await store.save();
+  return { mode: 'pending', submission: { id: sub.id }, fields: inserts.map((i) => i.field), message: '已提交，管理员确认后写入《' + r.title + '》' };
+});
+/** 白名单外被丢掉的位置：回填成 invalid 报告，前端能明确说「这一格写不进去」 */
+const INSERT_FIELDS_ALLOW = new Set(['title', 'type', 'score', 'summary', 'content', 'cover', 'gallery', 'image', 'tags', 'downloads', 'others', 'sourceUrl', 'meta', 'notes']);
+function droppedFields(input, kept) {
+  const list = Array.isArray(input) ? input : Array.isArray(input && input.inserts) ? input.inserts : [];
+  const keptFields = new Set(kept.map((k) => k.field));
+  const out = [];
+  for (const item of list) {
+    const field = String((item && item.field) || '').trim();
+    if (!field) continue;
+    if (!INSERT_FIELDS_ALLOW.has(field) || !keptFields.has(field)) out.push({ field, reason: INSERT_FIELDS_ALLOW.has(field) ? '内容为空或格式不对' : '不是可写入的位置' });
+  }
+  return out.slice(0, 24);
+}
+/** 只保留白名单字段，值统一做长度裁剪；具体写入规则在 store.insertInto 里 */
+function normalizeInserts(input) {
+  const list = Array.isArray(input) ? input : [input];
+  const allow = new Set(['title', 'type', 'score', 'summary', 'content', 'cover', 'gallery', 'image', 'tags', 'downloads', 'others', 'sourceUrl', 'meta', 'notes']);
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const field = String(item.field || '').trim();
+    if (!allow.has(field)) continue;
+    let value = item.value;
+    if (typeof value === 'string') value = value.slice(0, 20000);
+    else if (Array.isArray(value)) value = value.slice(0, 40).map((v) => (typeof v === 'string' ? v.slice(0, 400) : v && typeof v === 'object' ? trimObj(v) : v));
+    else if (value && typeof value === 'object') value = trimObj(value);
+    if (value === undefined || value === null || value === '') continue;
+    out.push({ field, value });
+  }
+  return out.slice(0, 24);
+}
+/**
+ * 把 inserts 里的外链图片转存到 /uploads（cover / gallery / image 三种位置）。
+ * 镜像失败不阻断：保留原始外链，只在 note 里说明「外链」，避免「点了没反应」。
+ */
+async function mirrorInsertImages(inserts = []) {
+  if (!store.db.settings.mirrorImagesByDefault) return inserts;
+  const out = [];
+  for (const item of inserts) {
+    const v = item.value;
+    const patchImage = async (img) => {
+      const url = String((img && img.url) || (typeof img === 'string' ? img : ''));
+      if (!/^https?:\/\//i.test(url)) return img;
+      const local = await mirrorImage(url, UPLOADS).catch(() => '');
+      if (!local) return img;
+      return typeof img === 'string' ? local : { ...img, url: local, remote: url };
+    };
+    if (item.field === 'cover' || item.field === 'image' || item.field === 'gallery') {
+      out.push({ ...item, value: await patchImage(v) });
+    } else if (item.field === 'downloads' || item.field === 'others') {
+      out.push({ ...item, value: typeof v === 'object' && v && /^https?:\/\//i.test(String(v.url || '')) && /\.(png|jpe?g|webp|gif|avif)(\?|$)/i.test(String(v.url)) ? await patchImage(v) : v });
+    } else out.push(item);
+  }
+  return out;
+}
+function trimObj(o) {
+  const out = {};
+  for (const [k, v] of Object.entries(o)) {
+    if (['url', 'caption', 'alt', 'label', 'code', 'size', 'quality', 'note', 'title', 'year', 'region', 'format', 'duration', 'developer', 'language', 'publisher', 'provider', 'kind'].includes(k)) out[k] = String(v ?? '').slice(0, 400);
+  }
+  return out;
+}
+const resourceBrief = (r) => ({
+  id: r.id, title: r.title, type: r.type, tags: r.tags, score: r.score, summary: r.summary, content: r.content,
+  cover: r.cover, gallery: r.gallery, downloads: r.downloads, others: r.others, sourceUrl: r.sourceUrl, meta: r.meta, updatedAt: r.updatedAt,
 });
 
 route('POST', /^\/api\/detect$/, ({ body, res, ip }) => {
@@ -583,7 +801,7 @@ route('POST', /^\/api\/submit$/, async ({ body, res, ip }) => {
 });
 
 // ---------- 管理：登录 ----------
-route('POST', /^\/api\/admin\/login$/, ({ body, res }) => {
+route('POST', /^\/api\/admin\/login$/, ({ req, body, res }) => {
   const user = String(body.user || '').trim();
   const pass = String(body.pass || '');
   const locked = store.db.admin.locks || (store.db.admin.locks = {});
@@ -599,33 +817,51 @@ route('POST', /^\/api\/admin\/login$/, ({ body, res }) => {
     return res.end(JSON.stringify({ ok: false, message: '账号或口令错误' }));
   }
   delete locked[user];
-  const sid = createSession(user);
-  setSession(res, sid);
-  store.log('auth', '管理员登录：' + user, { user });
+  const { token, ttl } = createSession(user, { remember: !!body.remember });
+  setSession(res, token, req, ttl);
+  store.log('auth', '管理员登录：' + user + (body.remember ? '（记住登录 30 天）' : ''), { user });
   store.save();
-  return { user, sid: '已建立会话（HttpOnly Cookie）' };
+  return {
+    user,
+    remember: !!body.remember,
+    expires: Date.now() + ttl,
+    message: '登录成功，会话已写入签名 Cookie；刷新页面、切换前后台、重启服务都不需要重新登录',
+    sid: '已建立会话（HttpOnly 签名 Cookie）',
+  };
 });
 route('POST', /^\/api\/admin\/logout$/, ({ req, res }) => {
-  clearSession(res, cookie(req, 'aurora_sid'));
+  clearSession(req, res, cookie(req, 'aurora_sid'));
   return { message: '已退出' };
 });
-route('GET', /^\/api\/admin\/session$/, ({ req }) => {
-  const s = sessionOf(req);
-  return { authed: !!s, user: s ? s.user : null, expires: s ? s.expires : 0 };
+route('GET', /^\/api\/admin\/session$/, ({ req, res }) => {
+  // 后台心跳走这里：只要页面开着就顺便续期
+  const s = touchSession(req, res);
+  return {
+    ...sessionView(req),
+    ttl: s ? s.ttl : 0,
+    now: Date.now(),
+    sessions: Object.values(store.db.admin.sessions || {}).map((x) => ({ user: x.user, expires: x.expires, remember: !!x.remember })),
+  };
 });
-route('POST', /^\/api\/admin\/password$/, ({ body, res, req }) => {
+route('POST', /^\/api\/admin\/password$/, ({ req, body, res }) => {
   const s = requireAdmin(req, res);
   if (!s) return;
   const next = String(body.pass || '');
   if (next.length < 6) return json(res, 400, { ok: false, message: '新口令至少 6 位' });
   if (hashPass(body.old || '', store.db.admin.secret) !== store.db.admin.passHash) return json(res, 400, { ok: false, message: '原口令不正确' });
+  const keepRemember = !!(s && s.remember);
   store.db.admin.secret = randomUUID();
   store.db.admin.passHash = hashPass(next, store.db.admin.secret);
   store.db.admin.isDefault = false;
+  // 改口令前签发的令牌整批作废（＝其他设备下线），
+  // 但当前这台设备直接换发新令牌，不用重新登录一遍。
+  store.db.admin.invalidBefore = Date.now();
   store.db.admin.sessions = {};
-  store.log('auth', '管理员口令已修改，所有会话已失效');
+  const { token, ttl } = createSession(store.db.admin.user, { remember: keepRemember });
+  setSession(res, token, req, ttl);
+  store.log('auth', '管理员口令已修改：其他会话已下线，当前会话保持登录');
   store.save();
-  return { message: '口令已更新，请重新登录' };
+  return { message: '口令已更新，其他设备需重新登录；本设备保持登录', session: sessionView(req) };
 });
 
 // ---------- 管理：Excel 导入 ----------
@@ -728,7 +964,7 @@ route('POST', /^\/api\/admin\/import\/commit$/, async ({ body, req, res }) => {
 });
 
 // ---------- 后台路由注册 ----------
-registerAdmin({ route, store, UPLOADS, requireAdmin, sessionOf, publicSettings, recomputeCounts, dashboardStats, stripInternal });
+registerAdmin({ route, store, UPLOADS, requireAdmin, sessionOf, sessionView, touchSession, publicSettings, recomputeCounts, dashboardStats, stripInternal });
 
 // ---------- 静态文件 ----------
 const CACHEABLE = /\.(svg|png|jpe?g|webp|gif|avif|ico|woff2)$/;

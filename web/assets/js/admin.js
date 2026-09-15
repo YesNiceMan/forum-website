@@ -11,6 +11,7 @@ const NAV = [
   { grp: '内容' },
   { hash: '#/dash', icon: '◎', name: '总览' },
   { hash: '#/resources', icon: '▦', name: '资源管理' },
+  { hash: '#/gaps', icon: '✧', name: '批量补全' },
   { hash: '#/submissions', icon: '✉', name: '投稿审核', badge: 'submissions' },
   { hash: '#/import', icon: '↧', name: '导入中心' },
   { hash: '#/archive', icon: '⛯', name: '回收站' },
@@ -25,7 +26,7 @@ const NAV = [
 ];
 const VIEWS = {
   '/dash': viewDash, '/resources': viewResources, '/new': (main, ctx) => viewEditor(main, null), '/edit/:id': viewEditor,
-  '/submissions': viewSubmissions, '/import': viewImport, '/archive': viewArchive, '/taxonomy': viewTaxonomy,
+  '/gaps': viewGaps, '/submissions': viewSubmissions, '/import': viewImport, '/archive': viewArchive, '/taxonomy': viewTaxonomy,
   '/sources': viewSources, '/media': viewMedia, '/logs': viewLogs, '/settings': viewSettings, '/backup': viewBackup,
 };
 const state = { path: '/', authed: false, user: 'admin', pending: 0, resFilters: { q: '', status: '', type: '', lack: '', sort: 'updated', page: 1, pageSize: 20 }, picked: new Set(), imp: null };
@@ -37,8 +38,11 @@ async function boot() {
   window.addEventListener('hashchange', route);
   try {
     store.bootstrap = await Api.bootstrap();
+    store.session = store.bootstrap.session || null;
     state.authed = !!(store.bootstrap.session && store.bootstrap.session.authed);
     state.user = state.authed ? store.bootstrap.session.user : 'admin';
+    paintSession();
+    keepSessionAlive();
   } catch (err) {
     $('#adminMain').innerHTML = '';
     $('#adminMain').append(el('<div class="empty"><div class="empty__art">⚠️</div><h3>无法连接服务</h3><p>' + escapeHtml(err.message || '') + '</p></div>'));
@@ -74,35 +78,109 @@ function bindChrome() {
     if (!(await confirmDialog({ title: '退出登录', text: '确定退出控制台？', okText: '退出' }))) return;
     try { await Api.logout(); } catch {}
     state.authed = false;
-    showGate(false);
+    store.session = null;
+    showGate(true);
+    paintSession();
     toast('已退出登录', 'ok');
   };
   $('#adminVersion').textContent = 'AURORA VAULT · ' + (store.bootstrap ? store.bootstrap.version : '1.0') + ' · ' + (store.bootstrap ? store.bootstrap.stats.resources : 0) + ' 条资源';
 }
+const REMEMBER_KEY = 'aurora.remember';
 function showGate(show) {
   const gate = $('#adminLogin');
   gate.hidden = !show;
-  if (show) {
-    setTimeout(() => $('#loginPass').focus(), 60);
-    $('#loginForm').onsubmit = async (e) => {
-      e.preventDefault();
-      const btn = e.target.querySelector('button');
-      btn.disabled = true;
-      btn.textContent = '登录中…';
-      try {
-        const res = await Api.login($('#loginUser').value.trim(), $('#loginPass').value);
-        state.authed = true;
-        state.user = res.user;
-        store.session = { authed: true, user: res.user };
-        gate.hidden = true;
-        toast(res.message || '登录成功', 'ok');
-        route();
-        refreshBadges();
-      } catch (err) { toast(err.message || '登录失败', 'bad', 4600); }
-      btn.disabled = false;
-      btn.textContent = '登录控制台';
-    };
+  if (!show) return;
+  const note = $('#loginNote');
+  if (note) note.textContent = '会话记在浏览器里：刷新、切换前后台、甚至重启服务都不用重新登录。';
+  const box = $('#loginRemember');
+  if (box) box.checked = localStorage.getItem(REMEMBER_KEY) !== '0';
+  setTimeout(() => $('#loginPass').focus(), 60);
+  $('#loginForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type=submit]');
+    const remember = !!(box && box.checked);
+    if (box) localStorage.setItem(REMEMBER_KEY, remember ? '1' : '0');
+    btn.disabled = true;
+    btn.textContent = '登录中…';
+    try {
+      const res = await Api.login($('#loginUser').value.trim(), $('#loginPass').value, remember);
+      state.authed = true;
+      state.user = res.user || 'admin';
+      store.session = { authed: true, user: state.user, remember, expires: res.expires || 0 };
+      paintSession();
+      gate.hidden = true;
+      toast(res.message || '登录成功', 'ok', 4600);
+      route();
+      refreshBadges();
+    } catch (err) {
+      if (note) note.textContent = err.message || '登录失败';
+      toast(err.message || '登录失败', 'bad', 4600);
+    }
+    btn.disabled = false;
+    btn.textContent = '登录控制台';
+  };
+}
+/** 侧栏那行小字：让人看得见「这次登录能撑到什么时候」 */
+function paintSession() {
+  const node = $('#sessionNote');
+  const user = $('#adminUser');
+  if (user) {
+    const b = user.querySelector('b');
+    if (b) b.textContent = state.authed ? state.user : '未登录';
+    const s = user.querySelector('span span, .tiny');
+    if (s) s.textContent = state.authed ? '已登录' : '需要口令';
   }
+  if (!node) return;
+  if (!state.authed) { node.textContent = '会话：未登录'; return; }
+  const exp = (store.session && store.session.expires) || 0;
+  const left = exp ? Math.max(0, exp - Date.now()) : 0;
+  const day = Math.floor(left / 86400000);
+  const hr = Math.floor((left % 86400000) / 3600000);
+  node.textContent = '会话：' + (store.session && store.session.remember ? '记住登录 ' : '') + (day ? day + ' 天 ' : '') + hr + ' 小时'
+    + ' · 使用中自动续期';
+  node.style.color = left && left < 3600 * 1000 ? 'var(--amber)' : '';
+}
+/**
+ * 保活：标签页重新可见、窗口重新聚焦、以及每 4 分钟一次心跳，都去敲 /api/admin/session。
+ * 服务端会滑动续期并把 Set-Cookie 发回来，于是「切到前台待一会儿再回后台」不会再要口令。
+ */
+let heartbeat = 0;
+function keepSessionAlive() {
+  if (heartbeat) return;
+  const ping = async (silent) => {
+    try {
+      const s = await Api.session();
+      const authed = !!(s && s.authed);
+      if (authed !== state.authed) {
+        state.authed = authed;
+        if (authed) { state.user = s.user || 'admin'; showGate(false); route(); refreshBadges(); }
+        else showGate(true);
+      }
+      store.session = { authed, user: s.user || null, expires: s.expires || 0, remember: !!s.remember };
+      paintSession();
+    } catch (err) {
+      if (err && err.status === 401 && state.authed) { state.authed = false; store.session = null; showGate(true); paintSession(); }
+    }
+  };
+  heartbeat = setInterval(() => ping(false), 4 * 60 * 1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) ping(true); });
+  window.addEventListener('focus', () => ping(true));
+}
+/** 401 自愈：先确认一次会话，别把还有效的 Cookie 判成「请重新登录」 */
+async function recover401() {
+  try {
+    const s = await Api.session();
+    if (s && s.authed) {
+      state.authed = true;
+      store.session = { authed: true, user: s.user, expires: s.expires, remember: !!s.remember };
+      paintSession();
+      return true;
+    }
+  } catch {}
+  state.authed = false;
+  showGate(true);
+  paintSession();
+  return false;
 }
 async function refreshBadges() {
   try {
@@ -136,7 +214,11 @@ async function route() {
   });
   document.title = (segments[0] ? crumbs(segments[0]) : '总览') + ' · AURORA 控制台';
   $('#adminCrumb').innerHTML = '<span class="mono tiny muted">控制台</span><span class="muted">/</span><b>' + escapeHtml(crumbs(segments[0] || 'dash')) + '</b>';
-  if (!state.authed) { renderLoginInto(main); return; }
+  if (!state.authed) {
+    // bootstrap 说没登录也别急着弹口令：再确认一次签名 Cookie（从前台切回来的路径最容易撞到这里）
+    const ok = await recover401();
+    if (!ok) { renderLoginInto(main); return; }
+  }
   if (!match) { main.innerHTML = emptyState({ icon: '🧭', title: '没有这个后台页面', action: '<a class="btn btn--sm btn--primary" href="#/dash">回到总览</a>' }); return; }
   main.innerHTML = '<div class="admin-boot"><span class="spinner"></span><span class="small muted">加载中…</span></div>';
   try {
@@ -144,7 +226,7 @@ async function route() {
     await match.fn(main, { params: match.params, query });
   } catch (err) {
     main.innerHTML = '';
-    if (err && err.status === 401) { showGate(true); return; }
+    if (err && err.status === 401) { if (await recover401()) { route(); return; } return; }
     main.append(el('<div class="empty"><div class="empty__art">⚠️</div><h3>加载失败</h3><p>' + escapeHtml(err.message || '未知错误') + '</p><a class="btn btn--sm btn--quiet" href="#/dash">回总览</a></div>'));
     return;
   }
@@ -158,6 +240,7 @@ function crumbs(seg) {
   const found = NAV.find((n) => n.hash === '#/' + seg);
   if (seg === 'edit') return '编辑资源';
   if (seg === 'new') return '新建资源';
+  if (seg === 'gaps') return '批量补全';
   return found ? found.name : '总览';
 }
 function renderLoginInto(main) {
@@ -173,7 +256,7 @@ function card(title, inner, extra) {
 }
 async function guard(promise, host) {
   try { return await promise; } catch (err) {
-    if (err && err.status === 401) { showGate(true); throw err; }
+    if (err && err.status === 401) { await recover401(); throw err; }
     host.innerHTML = '';
     host.append(el('<div class="empty"><div class="empty__art">⚠️</div><h3>' + escapeHtml(err.message || '请求失败') + '</h3></div>'));
     throw err;
@@ -266,6 +349,7 @@ async function viewResources(main, ctx) {
     '<div class="select-wrap"><select class="select" id="bulkAction" style="min-width:126px"><option value="">批量操作…</option><option value="publish">发布</option><option value="draft">转草稿</option><option value="feature">设精选</option><option value="unfeature">取消精选</option><option value="archive">归档</option><option value="delete">删除</option></select></div>',
     '<button class="btn btn--sm btn--primary" id="bulkGo">执行</button>',
     '<button class="btn btn--sm btn--quiet" id="checkPicked">检测链接</button>',
+    '<button class="btn btn--sm btn--quiet" id="gapsGo" title="抓取来源页 / 联网检索，只填空着的位置">✧ 批量补全空白</button>',
     '</div>',
     '<div id="resSummary" class="row row--wrap tiny mono muted" style="gap:10px;margin-bottom:10px"></div>',
     '<div class="table-wrap"><table class="table admin-table" id="resTable"></table></div>',
@@ -293,6 +377,7 @@ function bindFilters(main) {
   });
   main.querySelector('#bulkGo').onclick = () => runBulk(main);
   main.querySelector('#checkPicked').onclick = () => runCheckPicked(main);
+  main.querySelector('#gapsGo').onclick = () => { location.hash = state.picked.size ? '#/gaps?picked=1' : '#/gaps'; };
 }
 async function loadResources(main) {
   const f = state.resFilters;
@@ -322,6 +407,7 @@ async function loadResources(main) {
     if (act.dataset.a === 'preview') window.open('/#/resource/' + id, '_blank');
     if (act.dataset.a === 'check') runCheck(id, act);
     if (act.dataset.a === 'feature') quickFeature(r, main);
+    if (act.dataset.a === 'fill') fillOneRow(id, r, act, main);
     if (act.dataset.a === 'delete') removeResource(id, r, main);
   };
   updatePickInfo();
@@ -342,7 +428,7 @@ function rowHtml(r) {
     + '<td class="mono tiny">' + (r.downloads || []).length + '</td>'
     + '<td class="mono tiny">' + (r.others || []).length + '</td>'
     + '<td>' + statusBadge(r.status) + '</td>'
-    + '<td class="mono tiny muted" style="text-align:right">' + relTime(r.updatedAt) + '<div class="row row--tight" style="justify-content:flex-end;margin-top:4px"><button class="icon-btn icon-btn--sm" data-a="feature" title="精选">★</button><button class="icon-btn icon-btn--sm" data-a="edit" title="编辑">✎</button><button class="icon-btn icon-btn--sm" data-a="preview" title="前台预览">◉</button><button class="icon-btn icon-btn--sm" data-a="check" title="检测链接">⌕</button><button class="icon-btn icon-btn--sm" data-a="delete" title="删除">×</button></div></td>'
+    + '<td class="mono tiny muted" style="text-align:right">' + relTime(r.updatedAt) + '<div class="row row--tight" style="justify-content:flex-end;margin-top:4px"><button class="icon-btn icon-btn--sm" data-a="feature" title="精选">★</button><button class="icon-btn icon-btn--sm" data-a="edit" title="编辑">✎</button><button class="icon-btn icon-btn--sm" data-a="preview" title="前台预览">◉</button><button class="icon-btn icon-btn--sm" data-a="fill" title="补全这条的空白位置">✦</button><button class="icon-btn icon-btn--sm" data-a="check" title="检测链接">⌕</button><button class="icon-btn icon-btn--sm" data-a="delete" title="删除">×</button></div></td>'
     + '</tr>';
 }
 function paintPicks(table) {
@@ -413,6 +499,28 @@ async function runCheckPicked(main) {
   toast('检测完成，' + dead + ' 个链接失效', dead ? 'warn' : 'ok', 4200);
   loadResources(main);
 }
+/** 单条补全：走同一套批量引擎，只处理这一条，勾到的位置全给它 */
+async function fillOneRow(id, r, btn, main) {
+  if (btn.dataset.busy) return;
+  btn.dataset.busy = '1';
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await Api.admin.enrichBatch({
+      ids: [id], fields: GAP_ALL_KEYS, dryRun: false, limit: 1, useSearch: true, allowLinks: true,
+      mirror: !!(store.bootstrap.settings && store.bootstrap.settings.mirrorImagesByDefault), timeout: 9000, scope: 'ids',
+    });
+    const item = ((res.report || {}).items || [])[0] || {};
+    const names = (item.filled || []).map((x) => x.label).join('、');
+    toast(names ? '《' + (r && r.title ? r.title : '') + '》已补：' + names : (item.skipped || []).length ? '没能补到内容：' + ((item.skipped[0] || {}).reason || '来源页没有可用信息') : '这条已经填满了', names ? 'ok' : 'warn', 4600);
+    loadResources(main);
+  } catch (err) {
+    toast('补全失败：' + (err.message || '服务异常'), 'bad', 4600);
+  }
+  btn.disabled = false;
+  btn.textContent = '✦';
+  delete btn.dataset.busy;
+}
 async function runCheck(id, btn) {
   btn.disabled = true;
   try {
@@ -432,6 +540,225 @@ async function removeResource(id, r, main) {
   if (!(await confirmDialog({ title: '删除资源', text: '《' + (r && r.title ? r.title : id) + '》将移入回收站，可随时恢复。', okText: '删除', danger: true }))) return;
   try { await Api.admin.remove(id); toast('已移入回收站', 'ok'); state.picked.delete(id); loadResources(main); } catch (err) { toast(err.message, 'bad'); }
 }
+
+/* ---------- 批量补全空白 ---------- */
+/* 位置键与服务端 server/lib/gaps.mjs 的 GAP_FIELDS 一一对应 */
+const GAP_DEFAULT = ['summary', 'content', 'cover', 'gallery', 'tags', 'year', 'author', 'size', 'format'];
+const gap = { fields: new Set(GAP_DEFAULT), scope: 'filter', limit: 6, useSearch: true, allowLinks: false, mirror: true, autoNext: true, running: false, stop: false };
+async function viewGaps(main, ctx) {
+  if (ctx && ctx.query && ctx.query.picked && state.picked.size) gap.scope = 'picked';
+  main.innerHTML = [
+    head('批量补全空白', '抓资源自带链接 + 可选联网检索，只往还空着的位置写；已有内容一律不动（正文与图集按追加处理）',
+      '<a class="btn btn--sm btn--quiet" href="#/resources">← 资源管理</a><button class="btn btn--sm btn--quiet" id="gapPreview">预览能补什么</button><button class="btn btn--sm btn--primary" id="gapRun">开始批量补全</button>'),
+    '<div class="gap-layout">',
+    '<div class="gap-col">',
+    '<div class="card card--pad" data-reveal><div class="panel-h"><h3>补哪些位置</h3><span class="grow"></span><span class="tiny mono muted" id="gapSum">—</span></div><div id="gapFields"></div>'
+      + '<div class="row row--wrap" style="gap:6px;margin-top:12px"><button class="btn btn--sm btn--quiet" data-pick="all">全选</button>'
+      + '<button class="btn btn--sm btn--quiet" data-pick="default">推荐（文字+图片）</button><button class="btn btn--sm btn--quiet" data-pick="links">只补链接</button><button class="btn btn--sm btn--quiet" data-pick="none">清空</button></div></div>',
+    '<div class="card card--pad" data-reveal><div class="panel-h"><h3>处理范围</h3></div>'
+      + '<div class="field"><label>筛选条件</label><div class="row" style="gap:8px"><div class="select-wrap grow"><select class="select" id="gStatus">' + [['all', '全部状态'], ['published', '仅已发布'], ['draft', '仅草稿']].map(([k, n]) => '<option value="' + k + '">' + n + '</option>').join('') + '</select></div><div class="select-wrap grow"><select class="select" id="gType"><option value="">全部类型</option>' + store.bootstrap.types.map((t) => '<option value="' + escapeHtml(t.key) + '">' + escapeHtml(t.key) + '</option>').join('') + '</select></div></div></div>'
+      + '<div class="field" style="margin-top:10px"><label>标题 / 标签关键词</label><input class="input" id="gQ" placeholder="留空 = 不按关键词过滤" /></div>'
+      + '<div class="field" style="margin-top:10px"><label>范围</label><div class="seg" id="gScope"><button data-v="filter">按筛选条件</button><button data-v="picked">仅勾选的资源</button></div><span class="tiny muted" id="gScopeNote"></span></div>'
+      + '<div class="field" style="margin-top:10px"><label>每批条数（服务端限 30）</label><input class="input" id="gLimit" type="number" min="1" max="30" step="1" value="' + gap.limit + '" /></div>'
+      + '<div class="row row--wrap" style="gap:14px;margin-top:14px">'
+      + '<label class="switch"><input type="checkbox" id="gSearch"' + (gap.useSearch ? ' checked' : '') + ' /><span class="switch__track"></span><span class="small">允许联网检索补全</span></label>'
+      + '<label class="switch"><input type="checkbox" id="gLinks"' + (gap.allowLinks ? ' checked' : '') + ' /><span class="switch__track"></span><span class="small">补下载 / 其他来源</span></label>'
+      + '<label class="switch"><input type="checkbox" id="gMirror"' + (gap.mirror ? ' checked' : '') + ' /><span class="switch__track"></span><span class="small">图片转存本地</span></label>'
+      + '<label class="switch"><input type="checkbox" id="gAuto"' + (gap.autoNext ? ' checked' : '') + ' /><span class="switch__track"></span><span class="small">自动跑完剩余批次</span></label>'
+      + '</div>'
+      + '<p class="tiny muted" style="margin:10px 0 0">「补下载 / 其他来源」会把检索到的链接也写进资源，误报风险由你把关，建议先预览。</p>'
+      + '</div>',
+    '<div class="card card--pad" data-reveal><div class="panel-h"><h3>执行</h3><span class="grow"></span><button class="btn btn--sm btn--danger" id="gapStop" hidden>停止</button></div>'
+      + '<div class="gap-run"><div class="gap-run__stat" id="gapStat"><span>等待开始</span></div>'
+      + '<div class="gap-run__bar" id="gapBar">' + progressBar(0) + '</div>'
+      + '<p class="tiny muted" id="gapNote">先点「预览能补什么」看看要动哪些格子，再开始写库。</p></div></div>',
+    '</div>',
+    '<div class="gap-col">',
+    '<div class="card card--pad" data-reveal><div class="panel-h"><h3>待补清单</h3><span class="grow"></span><span class="tiny mono muted" id="gapPrevNote">完整度最低的先补</span></div><div id="gapPreviewHost"></div></div>',
+    '<div class="card card--pad" data-reveal><div class="panel-h"><h3>逐条报告</h3><span class="grow"></span><span class="tiny mono muted">写入的位置 / 补不上的原因</span></div><div class="gap-log" id="gapLog"><p class="tiny muted">还没有跑过。</p></div></div>',
+    '</div>',
+    '</div>',
+  ].join('');
+
+  const fieldsHost = main.querySelector('#gapFields');
+  const logHost = main.querySelector('#gapLog');
+  const stat = main.querySelector('#gapStat');
+  const bar = main.querySelector('#gapBar');
+  const note = main.querySelector('#gapNote');
+  let report = null;
+
+  const readOpts = () => {
+    gap.limit = Math.max(1, Math.min(30, Number(main.querySelector('#gLimit').value) || 6));
+    gap.useSearch = main.querySelector('#gSearch').checked;
+    gap.allowLinks = main.querySelector('#gLinks').checked;
+    gap.mirror = main.querySelector('#gMirror').checked;
+    gap.autoNext = main.querySelector('#gAuto').checked;
+    return {
+      status: main.querySelector('#gStatus').value,
+      type: main.querySelector('#gType').value,
+      q: main.querySelector('#gQ').value.trim(),
+    };
+  };
+  const scopeBody = (f) => (gap.scope === 'picked' ? { ids: Array.from(state.picked) } : { filter: f });
+
+  function paintFields(g) {
+    const groups = g.groups || {};
+    fieldsHost.innerHTML = '';
+    Object.keys(groups).forEach((name) => {
+      const box = el('<div class="gap-grp"><div class="gap-grp__title">' + escapeHtml(name) + '</div></div>');
+      groups[name].forEach((fld) => {
+        const on = gap.fields.has(fld.key);
+        const row = el('<label class="gap-field' + (on ? ' is-on' : '') + (fld.count ? '' : ' is-zero') + '"><input type="checkbox" class="check" data-f="' + fld.key + '"' + (on ? ' checked' : '') + ' /><b>' + escapeHtml(fld.label) + '</b><span class="gap-count">' + fld.count + ' 空</span></label>');
+        box.append(row);
+      });
+      fieldsHost.append(box);
+    });
+    fieldsHost.querySelectorAll('[data-f]').forEach((c) => {
+      c.onchange = () => {
+        if (c.checked) gap.fields.add(c.dataset.f); else gap.fields.delete(c.dataset.f);
+        c.closest('.gap-field').classList.toggle('is-on', c.checked);
+        syncSum();
+      };
+    });
+    syncSum();
+  }
+  function syncSum() {
+    const total = ((report && report.gaps) || { fields: [] }).fields.filter((f) => gap.fields.has(f.key)).reduce((n, f) => n + f.count, 0);
+    main.querySelector('#gapSum').textContent = '已选 ' + gap.fields.size + ' 类 · 共 ' + total + ' 个空格';
+    const res = main.querySelector('#resSummary');
+    if (res) void res;
+  }
+  function paintPreview(items, ids) {
+    const host = main.querySelector('#gapPreviewHost');
+    if (!items || !items.length) { host.innerHTML = '<p class="small muted">这个范围里没有还空着的格子，不用补。</p>'; return; }
+    host.innerHTML = '<div class="table-wrap"><table class="table table--compact"><thead><tr><th style="width:40px"></th><th>资源</th><th>还空着</th><th style="width:70px">完整度</th></tr></thead><tbody>'
+      + items.map((r) => '<tr data-id="' + r.id + '"><td><span class="gap-preview">' + (r.cover ? '<img src="' + imgSrc(r.cover, r.title) + '" alt="" loading="lazy" />' : escapeHtml(providerInitial(r.title))) + '</span></td>'
+        + '<td><a class="small" href="#/edit/' + r.id + '" style="font-weight:600">' + escapeHtml(r.title) + '</a><div class="tiny mono muted">' + escapeHtml(r.status) + (r.urls && r.urls.length ? ' · ' + r.urls.length + ' 个可抓链接' : ' · 无自带链接') + '</div></td>'
+        + '<td><div class="gap-item__tags">' + r.blanks.map((b) => '<span class="gap-tag' + (gap.fields.has(b.key) ? '' : ' is-skip') + '">' + escapeHtml(b.label) + '</span>').join('') + '</div></td>'
+        + '<td class="mono tiny">' + r.percent + '%</td></tr>').join('')
+      + '</tbody></table></div>';
+    main.querySelector('#gapPrevNote').textContent = '共 ' + (ids || items).length + ' 条待补 · 列出前 ' + items.length + ' 条';
+  }
+  function paintItems(items, dryRun) {
+    items.forEach((x) => {
+      const ok = x.filled.length;
+      const line = el('<div class="gap-item ' + (ok ? 'is-ok' : 'is-none') + '"><span class="gap-item__mark">' + (ok ? (dryRun ? '◈' : '✓') : '·') + '</span>'
+        + '<span style="min-width:0"><div class="gap-item__title">' + escapeHtml(x.title) + '</div><div class="gap-item__meta">'
+        + escapeHtml(dryRun ? '预览：' : '') + (ok ? '写入 ' + x.filled.length + ' 个位置' : '没补到内容')
+        + (x.skipped.length ? ' · ' + x.skipped.slice(0, 3).map((s) => s.label + '：' + s.reason).join(' / ') : '')
+        + (x.notes && x.notes.length ? ' · ' + escapeHtml(x.notes[0]) : '') + '</div></span>'
+        + '<span class="gap-item__tags">' + x.filled.slice(0, 8).map((s) => '<span class="gap-tag">' + escapeHtml(s.label) + '</span>').join('') + '</span></div>');
+      logHost.prepend(line);
+    });
+  }
+  function setProgress(text, pct) {
+    stat.innerHTML = text;
+    bar.innerHTML = progressBar(pct || 0) + (pct ? '<span class="gap-run__pct">' + Math.round(pct) + '%</span>' : '');
+  }
+
+  async function loadReport() {
+    const f = readOpts();
+    const data = await guard(Api.admin.gaps(Object.assign({}, f, gap.scope === 'picked' ? { ids: Array.from(state.picked).join(',') } : {})), fieldsHost);
+    report = data;
+    paintFields(data.gaps);
+    paintPreview(data.preview, data.ids);
+    const matched = (data.gaps.fields || []).filter((x) => gap.fields.has(x.key)).reduce((n, x) => n + x.count, 0);
+    note.textContent = data.total ? ('范围内 ' + data.total + ' 条还有空格 · 勾选的位置共 ' + matched + ' 个格子待补') : '这个范围里没有空缺，选好筛选条件再试。';
+    main.querySelector('#gScopeNote').textContent = gap.scope === 'picked'
+      ? (state.picked.size ? '已勾选 ' + state.picked.size + ' 条' : '还没在资源管理里勾选任何资源，先回列表勾选')
+      : '按上面的状态 / 类型 / 关键词过滤，完整度最低的先处理';
+  }
+
+  async function run(dryRun) {
+    if (gap.running) return toast('已经在跑了', 'warn');
+    if (!gap.fields.size) return toast('先勾选要补全的位置', 'warn');
+    if (gap.scope === 'picked' && !state.picked.size) return toast('范围选了「仅勾选的资源」，但列表里没勾选', 'warn');
+    const f = readOpts();
+    gap.running = true;
+    gap.stop = false;
+    main.querySelector('#gapStop').hidden = !dryRun;
+    main.querySelector('#gapRun').disabled = true;
+    main.querySelector('#gapPreview').disabled = true;
+    let batch = 0, scanned = 0, changed = 0, cells = 0, stalled = 0, remaining = 0, total = 0;
+    if (!dryRun) logHost.innerHTML = '';
+    try {
+      do {
+        batch++;
+        setProgress('<span class="spinner"></span> 第 ' + batch + ' 批 · ' + (dryRun ? '预览' : '抓取并写入') + '中（每批最多 ' + gap.limit + ' 条，含外网抓取，稍等）…', Math.min(96, (scanned / Math.max(1, total || scanned + gap.limit)) * 100));
+        const body = Object.assign({
+          fields: Array.from(gap.fields), dryRun, limit: gap.limit, useSearch: gap.useSearch, allowLinks: gap.allowLinks,
+          mirror: gap.mirror, concurrency: 2, timeout: 8000, scope: gap.scope,
+        }, scopeBody(f));
+        const res = await Api.admin.enrichBatch(body);
+        const rep = res.report || { items: [], changed: 0, cells: 0 };
+        scanned += res.scanned || 0;
+        changed += rep.changed || 0;
+        cells += rep.cells || 0;
+        remaining = res.remaining || 0;
+        total = res.matched || total;
+        paintItems(rep.items || [], dryRun);
+        setProgress('<span>' + (dryRun ? '预览批次 ' : '批次 ') + batch + ' 完成</span><span>已处理 <b>' + scanned + '</b> 条</span><span>可补 <b>' + cells + '</b> 个位置</span><span>涉及 <b>' + changed + '</b> 条资源</span>' + (remaining ? '<span>剩余 <b>' + remaining + '</b> 条</span>' : '<span>已跑完</span>'), total ? Math.min(100, (scanned / total) * 100) : 100);
+        if (!res.scanned) break;
+        if (!rep.changed) {
+          stalled += 1;
+          if (stalled >= 2) { note.textContent = '连续两批都没能补到内容：剩下的多是「来源页抓不到 / 检索不到可靠链接」，需要人工处理。'; break; }
+        } else stalled = 0;
+        if (dryRun) break;
+      } while (gap.autoNext && remaining > 0 && !gap.stop);
+      if (!dryRun) {
+        const doneMsg = gap.stop ? '已手动停止：已写入 ' + cells + ' 个位置。' : ('跑完了：' + scanned + ' 条资源里写入 ' + cells + ' 个位置，' + changed + ' 条有变化。');
+        note.textContent = doneMsg;
+        await loadReport();
+        reloadBootstrap();
+        note.textContent = doneMsg;   // loadReport 会改写提示行，跑完的结论要留在最后
+        toast('批量补全完成：写入 ' + cells + ' 个位置', 'ok', 4600);
+      } else {
+        const dryMsg = '预览完成：' + cells + ' 个空白位置可以补（未写库）。确认后点「开始批量补全」。';
+        note.textContent = dryMsg;
+        await loadReport();
+        note.textContent = dryMsg;   // 清单同步刷新了，但预览结论要留在提示行上
+        toast('预览：可补 ' + cells + ' 个位置 / ' + changed + ' 条资源', 'info', 4200);
+      }
+    } catch (err) {
+      note.textContent = '执行失败：' + (err.message || '服务异常');
+      toast('批量补全失败：' + (err.message || '服务异常'), 'bad', 5200);
+    } finally {
+      gap.running = false;
+      main.querySelector('#gapStop').hidden = true;
+      main.querySelector('#gapRun').disabled = false;
+      main.querySelector('#gapPreview').disabled = false;
+    }
+  }
+
+  main.querySelectorAll('[data-pick]').forEach((b) => {
+    b.onclick = () => {
+      const mode = b.dataset.pick;
+      gap.fields = new Set(mode === 'all' ? GAP_ALL_KEYS : mode === 'default' ? GAP_DEFAULT : mode === 'links' ? ['downloads', 'others', 'sourceUrl'] : []);
+      paintFields((report && report.gaps) || { groups: {} });
+      loadReport();
+    };
+  });
+  ['gStatus', 'gType', 'gQ', 'gLimit'].forEach((id) => {
+    const node = main.querySelector('#' + id);
+    node.addEventListener('change', loadReport);
+    if (id === 'gQ') node.addEventListener('input', () => { clearTimeout(node._t); node._t = setTimeout(loadReport, 500); });
+  });
+  main.querySelector('#gScope').onclick = (e) => {
+    const b = e.target.closest('[data-v]');
+    if (!b) return;
+    gap.scope = b.dataset.v;
+    Array.from(main.querySelectorAll('#gScope button')).forEach((x) => x.classList.toggle('on', x === b));
+    loadReport();
+  };
+  main.querySelector('#gapPreview').onclick = () => run(true);
+  main.querySelector('#gapRun').onclick = () => run(false);
+  main.querySelector('#gapStop').onclick = () => { gap.stop = true; note.textContent = '正在收尾当前批次…'; };
+  Array.from(main.querySelectorAll('#gScope button')).forEach((x) => x.classList.toggle('on', x.dataset.v === gap.scope));
+  await loadReport();
+  reveal(main);
+  rippleAll(main);
+}
+const GAP_ALL_KEYS = ['summary', 'content', 'cover', 'gallery', 'tags', 'type', 'score', 'year', 'author', 'size', 'format', 'sourceUrl', 'others', 'downloads'];
 
 /* ---------- 资源编辑器 ---------- */
 async function viewEditor(main, ctx) {
@@ -505,6 +832,49 @@ async function saveResource(id, form, main) {
   btn.textContent = '保存';
 }
 async function autoFill(main, form, r, btn) {
+  // 已入库的资源直接走「批量补全」引擎：dryRun 拿到 patch，只填表单还没写的空字段
+  if (r && r.id) {
+    btn.disabled = true;
+    btn.textContent = '识别中…';
+    try {
+      const res = await Api.admin.enrichBatch({ ids: [r.id], fields: GAP_ALL_KEYS, dryRun: true, limit: 1, useSearch: true, allowLinks: true, timeout: 9000, mirror: !!(store.bootstrap.settings && store.bootstrap.settings.mirrorImagesByDefault), scope: 'ids' });
+      const item = ((res.report || {}).items || [])[0];
+      const patch = (item && item.patch) || {};
+      const v = form.value;
+      const apply = {};
+      if (!v.summary && patch.summary) apply.summary = String(patch.summary).slice(0, 400);
+      if (!v.content && patch.content) apply.content = stripTagsToText(patch.content);
+      if (!v.cover && patch.cover) apply.cover = patch.cover;
+      if ((!v.gallery || !v.gallery.length) && Array.isArray(patch.gallery)) apply.gallery = patch.gallery;
+      if ((!v.tags || !v.tags.length) && Array.isArray(patch.tags)) apply.tags = patch.tags;
+      if ((!v.type || v.type === '其他') && patch.type) apply.type = patch.type;
+      if (!Number(v.score) && patch.score) apply.score = patch.score;
+      if (!v.sourceUrl && patch.sourceUrl) apply.sourceUrl = patch.sourceUrl;
+      const m = patch.meta || {};
+      if (!v.year && m.year) apply.year = m.year;
+      if (!v.region && m.region) apply.region = m.region;
+      if (!v.size && m.size) apply.size = m.size;
+      if (!v.format && m.format) apply.format = m.format;
+      if (!v.author && (m.developer || m.publisher)) apply.author = m.developer || m.publisher;
+      const dlAdd = (patch.downloads || []).filter((l) => l && l.url && !v.downloads.some((x) => x.url === l.url));
+      const otAdd = (patch.others || []).filter((l) => l && l.url && !v.others.some((x) => x.url === l.url));
+      if (dlAdd.length) apply.downloads = [...v.downloads, ...dlAdd];
+      if (otAdd.length) apply.others = [...v.others, ...otAdd];
+      if (Object.keys(apply).length) {
+        form.set(apply);
+        dirty = true;
+        showComplete(main, form);
+        toast('已按空白位置补进表单：' + Object.keys(apply).join('、') + '（确认无误后点保存）', 'ok', 5200);
+      } else {
+        toast('没抓到能填进空白处的内容' + (((item && item.skipped) || [])[0] ? '：' + item.skipped[0].reason : ''), 'warn', 4600);
+      }
+    } catch (err) {
+      toast('补全失败：' + (err.message || '服务异常'), 'bad', 4600);
+    }
+    btn.disabled = false;
+    btn.textContent = '一键补全空白';
+    return;
+  }
   const v = form.value;
   const urls = [];
   if (v.sourceUrl) urls.push(v.sourceUrl);
@@ -600,18 +970,32 @@ async function viewSubmissions(main) {
     rippleAll(host);
   }
 }
+const PATCH_LABEL = { title: '标题', type: '类型', tags: '标签', score: '分数', summary: '简介', content: '内容/正文', cover: '封面图', gallery: '图集', image: '图集', downloads: '资源下载', others: '其他来源', sourceUrl: '来源地址', meta: '资源信息', notes: '备注' };
+const insertValue = (i) => {
+  const v = i && i.value;
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.map((x) => (typeof x === 'string' ? x : (x && (x.url || x.caption)) || '')).filter(Boolean).join(' / ');
+  if (v && typeof v === 'object') return Object.values(v).filter((x) => x && typeof x !== 'object').join(' · ') || String(v.url || '');
+  return String(v == null ? '' : v);
+};
 function subCard(s, main, reload) {
   const draft = s.draft || {};
   const c = s.completeness || { percent: 0, missing: [] };
   const node = resourceCard({ id: s.id, title: draft.title || '（未命名）', type: draft.type, tags: draft.tags, score: draft.score, summary: draft.summary, cover: draft.cover || ((draft.gallery || [])[0] || {}).url || '', downloads: draft.downloads || [], others: draft.others || [], gallery: draft.gallery || [], createdAt: s.createdAt, updatedAt: s.createdAt, completeness: c, status: 'pending', featured: false, meta: {} });
   const isSource = s.kind === 'source';
-  const badge = el('<span class="badge ' + (isSource ? 'badge--live' : 'badge--brand') + '" style="position:absolute;left:12px;top:56px;z-index:5">' + (isSource ? '来源补充' : ({ pending: '待审核', approved: '已通过', rejected: '已驳回' }[s.status] || s.status)) + '</span>');
+  const isPatch = s.kind === 'patch';
+  const badge = el('<span class="badge ' + (isSource || isPatch ? 'badge--live' : 'badge--brand') + '" style="position:absolute;left:12px;top:56px;z-index:5">' + (isSource ? '来源补充' : isPatch ? '内容补充' : ({ pending: '待审核', approved: '已通过', rejected: '已驳回' }[s.status] || s.status)) + '</span>');
   node.append(badge);
-  // 补源投稿不能「存草稿」，也不该新建资源：唯一的通过动作就是并入原条目
+  if (isPatch && (s.insertLabels || []).length) {
+    node.append(el('<div class="sub-inserts">' + (s.insertLabels || []).map((t) => '<span class="gap-tag">' + escapeHtml(t) + '</span>').join('') + '</div>'));
+  }
+  // 补源 / 内容补充都不能「存草稿」，也不该新建资源：唯一的通过动作就是写回原条目
   const acts = isSource
     ? '<button class="btn btn--sm btn--primary" data-s="publish">并入该资源</button><button class="btn btn--sm btn--danger" data-s="reject">驳回</button>'
-    : '<button class="btn btn--sm btn--primary" data-s="publish">通过并发布</button><button class="btn btn--sm btn--quiet" data-s="approve">仅通过</button><button class="btn btn--sm btn--danger" data-s="reject">驳回</button>';
-  const target = isSource ? '<span class="badge" title="通过后并入这条资源">并入《' + escapeHtml(s.resourceTitle || s.title || s.resourceId || '') + '》</span>' : '';
+    : isPatch
+      ? '<button class="btn btn--sm btn--primary" data-s="publish">写入该资源</button><button class="btn btn--sm btn--quiet" data-s="approve">仅通过</button><button class="btn btn--sm btn--danger" data-s="reject">驳回</button>'
+      : '<button class="btn btn--sm btn--primary" data-s="publish">通过并发布</button><button class="btn btn--sm btn--quiet" data-s="approve">仅通过</button><button class="btn btn--sm btn--danger" data-s="reject">驳回</button>';
+  const target = (isSource || isPatch) ? '<span class="badge" title="通过后写入这条资源">' + (isPatch ? '写入' : '并入') + '《' + escapeHtml(s.targetTitle || s.resourceTitle || s.title || s.resourceId || '') + '》</span>' : '';
   const foot = el('<div class="row row--tight" style="padding:0 16px 14px;gap:6px;flex-wrap:wrap"><button class="btn btn--sm btn--quiet" data-s="detail">查看详情</button>' + acts + target + '<span class="grow"></span><span class="tiny mono muted">' + escapeHtml(s.from || '匿名') + ' · ' + relTime(s.createdAt) + '</span></div>');
   node.append(foot);
   foot.onclick = (e) => {
@@ -635,6 +1019,7 @@ async function decide(s, action, main, reload) {
   } catch (err) { toast(label + '失败：' + err.message, 'bad'); }
 }
 function openSubmission(s, main, reload) {
+  if (s.kind === 'patch') return openPatchSubmission(s, main, reload);
   const draft = JSON.parse(JSON.stringify(s.draft || {}));
   let form = null;
   const wrap = el(['<div>',
@@ -674,6 +1059,71 @@ function openSubmission(s, main, reload) {
       reload && reload();
     } catch (err) { toast('处理失败：' + err.message, 'bad'); }
   };
+}
+
+/**
+ * 内容补充投稿（前台「找更多来源」点选插入）：逐条勾选要写入的位置，
+ * 编辑文字后写回原资源；也可只标记通过、或整条驳回。
+ */
+function openPatchSubmission(s, main, reload) {
+  const inserts = Array.isArray(s.inserts) ? s.inserts : [];
+  let chosen = new Set(inserts.map((x, i) => i));
+  const host = el(['<div>',
+    '<div class="hint-strip" style="margin-bottom:14px"><span>⤴</span><div><b>' + escapeHtml(s.from || '匿名') + '</b> 在 ' + new Date(s.createdAt).toLocaleString('zh-CN') + ' 从「找更多来源」点了 ' + inserts.length + ' 处内容'
+      + (s.resourceId ? '，目标资源：<a class="link-quiet" href="#/edit/' + escapeHtml(s.resourceId) + '">《' + escapeHtml(s.targetTitle || s.resourceTitle || s.resourceId) + '》</a>' : '，目标资源已不在库中')
+      + (s.sourceUrl ? ' · 来源 <a class="link-quiet" target="_blank" rel="noopener nofollow" href="' + escapeHtml(s.sourceUrl) + '">原页</a>' : '') + '</div></div>',
+    '<div class="sub-insert-list"></div>',
+    '<div class="row row--wrap" style="gap:8px;margin-top:12px"><input class="input" id="subNote" placeholder="给访客留个说明（可选）" style="max-width:280px" /></div>',
+    '<div class="divider"></div>',
+    '<div class="row row--wrap" style="gap:8px"><span class="tiny mono muted grow" id="subHint"></span>'
+      + '<button class="btn btn--sm btn--quiet" data-pick="all">全选</button><button class="btn btn--sm btn--quiet" data-pick="none">全不选</button>'
+      + '<button class="btn btn--sm btn--quiet" data-act="approve">仅通过不写入</button><button class="btn btn--sm btn--danger" data-act="reject">驳回</button>'
+      + '<button class="btn btn--sm btn--brand" data-act="publish">写入所选</button></div>',
+    '</div>'].join(''));
+  const list = host.querySelector('.sub-insert-list');
+  const paint = () => {
+    list.innerHTML = '';
+    if (!inserts.length) { list.innerHTML = '<p class="muted small">这条投稿没有携带可写入的内容。</p>'; return; }
+    inserts.forEach((it, i) => {
+      const value = insertValue(it);
+      const row = el(['<label class="ins-row' + (chosen.has(i) ? ' is-on' : '') + '">',
+        '<span class="ins-row__pick"><input type="checkbox" class="check" data-i="' + i + '"' + (chosen.has(i) ? ' checked' : '') + ' /><span class="ins-row__icon">' + (it.field === 'cover' || it.field === 'gallery' || it.field === 'image' ? '▣' : it.field === 'downloads' || it.field === 'others' || it.field === 'sourceUrl' ? '⛓' : '¶') + '</span></span>',
+        '<span class="ins-row__main"><span class="ins-row__text"></span>',
+        '<span class="ins-row__sub tiny mono muted">' + escapeHtml(PATCH_LABEL[it.field] || it.field || '内容') + ' · ' + (it.value && typeof it.value === 'object' && !Array.isArray(it.value) ? Object.keys(it.value).join('/') : typeof it.value) + '</span></span>',
+        (it.field === 'cover' || it.field === 'gallery' || it.field === 'image') && /^\/(uploads\/|assets\/)|^https?:/.test(String((it.value || {}).url || '')) ? '<img class="ins-row__thumb" src="' + escapeHtml((it.value || {}).url) + '" alt="" loading="lazy" />' : '',
+        '</label>'].join(''));
+      row.querySelector('.ins-row__text').textContent = value.length > 160 ? value.slice(0, 160) + '…' : value;
+      list.append(row);
+    });
+    const hint = host.querySelector('#subHint');
+    if (hint) hint.textContent = '已选 ' + chosen.size + ' / ' + inserts.length + ' 处 · 写入规则与服务端一致：只填空位，正文与图集追加';
+  };
+  paint();
+  host.onclick = async (e) => {
+    const cb = e.target.closest('[data-i]');
+    if (cb) { const i = Number(cb.dataset.i); if (cb.checked) chosen.add(i); else chosen.delete(i); paint(); return; }
+    const pk = e.target.closest('[data-pick]');
+    if (pk) { chosen = new Set(pk.dataset.pick === 'all' ? inserts.map((x, i) => i) : []); paint(); return; }
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === 'reject') { if (!(await confirmDialog({ title: '驳回内容补充', text: '驳回后不会写入资源，可在说明里写原因。', okText: '驳回', danger: true }))) return; }
+    if (act === 'publish' && !chosen.size) return toast('先勾选要写入的位置', 'warn');
+    const payload = {
+      action: act === 'publish' ? 'publish' : act,
+      note: (host.querySelector('#subNote').value || '').slice(0, 200),
+      inserts: Array.from(chosen).map((i) => inserts[i]),
+    };
+    b.disabled = true;
+    try {
+      const res = await Api.admin.decide(s.id, payload);
+      toast((res && res.message) || '处理完成', 'ok', 4600);
+      ctrl.close();
+      refreshBadges();
+      reload && reload();
+    } catch (err) { toast('处理失败：' + (err.message || '服务异常'), 'bad', 4600); b.disabled = false; }
+  };
+  const ctrl = modal({ title: '内容补充 · ' + (s.targetTitle || s.resourceTitle || s.title || '未命名'), sub: '前台点选的内容，写入前可逐条挑。', size: 'modal--wide', body: host });
 }
 
 /* ---------- 导入中心（后台） ---------- */

@@ -34,7 +34,7 @@ export async function detail(host, ctx) {
     '<h1>' + escapeHtml(r.title) + '</h1>',
     (r.altTitles && r.altTitles.length ? '<p class="tiny muted" style="margin:6px 0 0">别名：' + r.altTitles.map(escapeHtml).join(' / ') + '</p>' : ''),
     '<div class="tiny mono muted" style="margin:14px 0 5px;letter-spacing:.18em">简介 SUMMARY</div>',
-    '<p class="dim" style="margin:0;max-width:72ch;font-size:14.5px">' + (r.summary ? escapeHtml(r.summary) : '<span class="muted">该资源还没有简介，可在后台或使用导入向导补全。</span>') + '</p>',
+    '<p class="dim" style="margin:0;max-width:72ch;font-size:14.5px">' + (r.summary ? escapeHtml(r.summary) : '<span class="muted">该资源还没有简介：点右上「找更多来源」，在结果里点一下「¶ 简介」小块就能直接插到这里。</span>') + '</p>',
     '<div class="row row--wrap" style="gap:8px;margin-top:14px">' + (r.tags || []).map((t) => '<a class="tag" href="#/library?tag=' + encodeURIComponent(t) + '">#' + escapeHtml(t) + '</a>').join('') + '</div>',
     '<div class="row row--wrap" style="gap:10px;margin-top:20px">',
     '<button class="btn btn--primary" id="topDownload"><svg viewBox="0 0 24 24" class="icon"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>查看下载</button>',
@@ -86,10 +86,10 @@ export async function detail(host, ctx) {
   /* 下载 / 来源 */
   const dlHost = host.querySelector('#downloadHost');
   if (r.downloads.length) r.downloads.forEach((l) => dlHost.append(linkRow(l, 'download')));
-  else host.querySelector('#dlEmpty').innerHTML = '<div class="hint-strip warn-strip">未识别到可用下载地址。可在<a class="link-quiet" href="#/search?q=' + encodeURIComponent(r.title) + '">聚合搜索</a>里找资源后回填，或在后台编辑补全。</div>';
+  else host.querySelector('#dlEmpty').innerHTML = '<div class="hint-strip warn-strip">未识别到可用下载地址。点<a class="link-quiet" href="#/search?q=' + encodeURIComponent(r.title) + '&id=' + r.id + '">找更多来源</a>，在搜索结果里点一下网盘 / 磁力链接就能插进这里；也可以在后台「批量补全空白」。</div>';
   const otHost = host.querySelector('#otherHost');
   if (r.others.length) r.others.forEach((l) => otHost.append(linkRow(l, 'other')));
-  else host.querySelector('#otherEmpty').innerHTML = '<p class="muted">暂无其他来源。</p>';
+  else host.querySelector('#otherEmpty').innerHTML = '<div class="hint-strip">暂无其他来源。<a class="link-quiet" href="#/search?q=' + encodeURIComponent(r.title) + '&id=' + r.id + '">找更多来源</a> 里点结果下方的「⛓ 其他来源」小块即可写入。</div>';
 
   /* 相关推荐 */
   const rel = host.querySelector('#relatedCard');

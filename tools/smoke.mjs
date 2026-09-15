@@ -154,6 +154,60 @@ check('  · 同一链接不重复加入（忽略尾斜杠）', dup.data.mode ===
 const net = await call('POST', '/api/resources/' + tmpId + '/contribute', { url: 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567' });
 check('  · 管理员会话直接并入下载列表', net.data.mode === 'appended' && net.data.field === '资源下载', JSON.stringify(net.data).slice(0, 140));
 
+/* ---- 需求 4-3：签名 Cookie 会话（刷新 / 重启 / 切前台不再掉线） ---- */
+const sess = await call('GET', '/api/admin/session');
+check('会话：登录后可查到期时间与在线列表', sess.data.authed === true && sess.data.expires > Date.now() && Array.isArray(sess.data.sessions), JSON.stringify({ a: sess.data.authed, r: sess.data.remember }));
+const bootWithCookie = await call('GET', '/api/bootstrap');
+check('  · bootstrap 透出真实会话（前后台共用一个登录态）', !!bootWithCookie.data.session && bootWithCookie.data.session.authed === true, JSON.stringify(bootWithCookie.data.session || null));
+const sidValue = (jar.cookie.match(/aurora_sid=([^;]+)/) || [])[1] || '';
+const tokenOnly = await fetch(BASE + '/api/admin/overview', { headers: { cookie: 'aurora_sid=' + sidValue } });
+check('  · 只带签名 Cookie 也能进后台（不依赖库里那份 sessions）', tokenOnly.status === 200, 'status=' + tokenOnly.status);
+const forged = await fetch(BASE + '/api/admin/overview', { headers: { cookie: 'aurora_sid=' + sidValue.slice(0, -6) + 'deadbe' } });
+check('  · 篡改签名会被拒', forged.status === 401, 'status=' + forged.status);
+
+/* ---- 需求 4-1：「找更多来源」点选插入到资源对应位置 ---- */
+const insTarget = await call('POST', '/api/admin/resources', { title: '自检插入目标 ' + Date.now(), type: '', tags: [], summary: '', content: '', cover: '', gallery: [], downloads: [], others: [], sourceUrl: 'https://example.com/', status: 'published' });
+const insId = (insTarget.data.resource || {}).id;
+check('准备插入目标资源（全空）', !!insId, JSON.stringify(insTarget.data).slice(0, 70));
+const visIns = await call('POST', '/api/resources/' + insId + '/insert', { source: '自检', inserts: [{ field: 'summary', value: '访客点来的一段简介文字。' }, { field: 'gallery', value: { url: 'https://example.com/nope.png', caption: '外链图' } }] }, { headers: { cookie: '' } });
+check('访客插入 → 待审内容补充投稿', visIns.status === 200 && visIns.data.mode === 'pending' && !!visIns.data.submission, JSON.stringify(visIns.data).slice(0, 130));
+const patchView = (await call('GET', '/api/admin/submissions?status=pending')).data.items.find((x) => x.id === (visIns.data.submission || {}).id);
+check('  · 待审列表带 inserts 与位置标签', !!patchView && patchView.kind === 'patch' && (patchView.inserts || []).length === 2 && /简介/.test((patchView.insertLabels || []).join('')), JSON.stringify({ kind: (patchView || {}).kind, n: ((patchView || {}).inserts || []).length }));
+const applied = await call('POST', '/api/admin/submissions/' + visIns.data.submission.id + '/decide', { action: 'publish', inserts: [{ field: 'summary', value: '访客点来的一段简介文字。' }] });
+check('  · 后台「写入所选」只写勾到的那条', applied.status === 200 && String(applied.data.resource.summary).length > 6 && !(applied.data.resource.gallery || []).length, JSON.stringify({ s: String(applied.data.resource.summary).slice(0, 12), g: (applied.data.resource.gallery || []).length }));
+const adminIns = await call('POST', '/api/resources/' + insId + '/insert', {
+  source: '自检 · 聚合搜索',
+  inserts: [
+    { field: 'cover', value: { url: '/uploads/seed/ridge.svg', caption: '封面' } },
+    { field: 'tags', value: ['自检标签A', '自检标签B'] },
+    { field: 'meta', value: { year: '2024', size: '1.2 GB' } },
+    { field: 'content', value: '正文第一段。' },
+    { field: 'others', value: { url: 'https://example.com/ins-' + Date.now(), label: '示例站' } },
+    { field: 'password', value: '不在白名单里' },
+  ],
+});
+const rep = adminIns.data.report || {};
+check('管理员插入 → 立即写入并回传逐项处置', adminIns.data.mode === 'inserted' && ((rep.filled || []).length + (rep.appended || []).length) >= 5 && (rep.invalid || []).length === 1, JSON.stringify({ f: (rep.filled || []).map((x) => x.key), a: (rep.appended || []).map((x) => x.key), inv: (rep.invalid || []).map((x) => x.key) }));
+const afterIns = (await call('GET', '/api/resources/' + insId)).data.resource;
+check('  · 位置落点正确（封面 / 标签 / 元数据 / 正文 / 其他来源）', afterIns.cover === '/uploads/seed/ridge.svg' && afterIns.tags.length >= 2 && afterIns.meta.year === '2024' && /正文第一段/.test(afterIns.content) && afterIns.others.length === 1, JSON.stringify({ cover: !!afterIns.cover, tags: afterIns.tags.length, year: afterIns.meta.year, others: afterIns.others.length }));
+check('  · 完整度随之上升', (adminIns.data.completeness || {}).percent > 30, 'percent=' + (adminIns.data.completeness || {}).percent);
+const noopIns = await call('POST', '/api/resources/' + insId + '/insert', { inserts: [{ field: 'cover', value: { url: '/uploads/seed/ridge.svg' } }] });
+check('  · 已有内容不重复写（同图 / 同链接判 duplicate）', noopIns.data.mode === 'noop' || (noopIns.data.report.duplicate || []).length + (noopIns.data.report.skipped || []).length > 0, JSON.stringify(noopIns.data).slice(0, 110));
+await call('POST', '/api/resources/' + insId + '/insert', { inserts: [{ field: 'content', value: '<script>alert(1)</script><p>正常段落</p>' }] });
+const xssBody = (await call('GET', '/api/resources/' + insId)).data.resource.content;
+check('  · 插入正文经富文本清洗（脚本标签不入库）', !/<script/i.test(xssBody) && /正常段落/.test(xssBody), xssBody.slice(0, 70));
+
+/* ---- 需求 4-2：后台批量补全空白 ---- */
+const gaps = await call('GET', '/api/admin/gaps?status=all');
+check('GET /api/admin/gaps 位置统计', gaps.status === 200 && (gaps.data.gaps.fields || []).length >= 12 && gaps.data.total >= 1 && Array.isArray(gaps.data.preview), JSON.stringify({ total: gaps.data.total, cells: gaps.data.gaps.emptyCells }));
+check('  · 待补清单含空位标签与可抓链接', (gaps.data.preview[0] || {}).blanks !== undefined && (gaps.data.preview[0] || {}).urls !== undefined, JSON.stringify((gaps.data.preview[0] || {}).blanks || []).slice(0, 90));
+const dry = await call('POST', '/api/admin/enrich-batch', { ids: [insId], fields: ['summary', 'content', 'cover', 'gallery', 'tags', 'type', 'score', 'year', 'author', 'size', 'format'], dryRun: true, limit: 5, useSearch: false, allowLinks: false });
+check('POST enrich-batch 预览不写库', dry.status === 200 && dry.data.dryRun === true && Array.isArray(dry.data.report.items) && dry.data.scanned === 1, JSON.stringify({ scanned: dry.data.scanned, matched: dry.data.matched }));
+const realFill = await call('POST', '/api/admin/enrich-batch', { ids: [insId], fields: ['summary', 'content', 'cover', 'gallery', 'tags', 'type', 'score', 'year', 'author', 'size', 'format'], dryRun: false, limit: 1, useSearch: false, scope: 'ids' });
+check('  · 真写批次返回逐条报告', realFill.status === 200 && typeof realFill.data.remaining === 'number' && (realFill.data.report.items[0] || {}).filled !== undefined, JSON.stringify(realFill.data.report.items[0] || {}).slice(0, 130));
+const filterFill = await call('POST', '/api/admin/enrich-batch?status=published&q=' + encodeURIComponent('自检插入目标'), { dryRun: true, limit: 3, useSearch: false, fields: ['format'] });
+check('  · 按筛选条件圈定批次', filterFill.status === 200 && filterFill.data.matched >= 1, JSON.stringify({ matched: filterFill.data.matched, scanned: filterFill.data.scanned }));
+
 const tax = await call('POST', '/api/admin/types', { key: '自检类型', name: '自检类型', color: '#ff0000', icon: '?' });
 check('新增类型', tax.data.types.some((t) => t.key === '自检类型'));
 const t2 = await call('POST', '/api/admin/types', { key: '自检类型', name: '自检类型改', color: '#00ff00' });
@@ -209,6 +263,7 @@ for (const c of [commit, commitAll, commitAgain]) {
 }
 if (approve.data && approve.data.resource) junkIds.add(approve.data.resource.id);
 if (tmpId) junkIds.add(tmpId); // 自检补源用的临时资源
+if (insId) junkIds.add(insId); // 自检「点选插入 / 批量补全」用的临时资源
 let cleaned = 0;
 for (const id of junkIds) {
   await call('DELETE', '/api/admin/resources/' + id);
